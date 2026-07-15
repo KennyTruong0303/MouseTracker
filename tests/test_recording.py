@@ -25,7 +25,12 @@ from rfid_tracking.recording.ffmpeg_recorder import (
     SegmentWriter,
     capture_command,
     capture_thread,
+    default_stop_file,
+    keyboard_stop_thread,
+    main,
     put_packet,
+    request_stop_file,
+    stop_file_watcher_thread,
     synthetic_capture_thread,
     writer_thread,
 )
@@ -344,6 +349,102 @@ class RecordingWriterTests(unittest.TestCase):
         while not packets.empty():
             queued.append(packets.get_nowait())
         self.assertGreaterEqual(len(queued), 2)
+
+    def test_keyboard_q_requests_shutdown(self):
+        state = RecorderState(threading.Event(), mock.Mock(), RecorderStats())
+        keyboard_stop_thread(state, io.StringIO("q\n"))
+        self.assertTrue(state.shutdown_requested.is_set())
+        self.assertEqual(state.shutdown_source, "keyboard q command")
+
+    def test_keyboard_stop_requests_shutdown(self):
+        state = RecorderState(threading.Event(), mock.Mock(), RecorderStats())
+        keyboard_stop_thread(state, io.StringIO("stop\n"))
+        self.assertTrue(state.shutdown_requested.is_set())
+        self.assertEqual(state.shutdown_source, "keyboard stop command")
+
+    def test_stop_file_requests_shutdown_and_marks_file_handled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = RecorderState(threading.Event(), mock.Mock(), RecorderStats())
+            stop_file = Path(tmp) / "STOP_RECORDING"
+            stop_file.write_text("stop\n", encoding="utf-8")
+            stop_file_watcher_thread(state, stop_file, interval_s=0.001)
+            self.assertTrue(state.shutdown_requested.is_set())
+            self.assertEqual(state.shutdown_source, f"stop file {stop_file}")
+            self.assertFalse(stop_file.exists())
+            self.assertTrue((Path(tmp) / "STOP_RECORDING.handled").exists())
+
+    def test_request_stop_creates_default_stop_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            path = request_stop_file(output_dir)
+            self.assertEqual(path, default_stop_file(output_dir))
+            self.assertEqual(path.read_text(encoding="utf-8"), "stop\n")
+
+    def test_main_request_stop_uses_output_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc = main(["--request-stop", "--output-dir", tmp])
+            self.assertEqual(rc, 0)
+            self.assertTrue((Path(tmp) / "STOP_RECORDING").exists())
+
+    def test_multiple_stop_requests_are_idempotent(self):
+        state = RecorderState(threading.Event(), mock.Mock(), RecorderStats())
+        self.assertTrue(state.request_shutdown("first"))
+        self.assertFalse(state.request_shutdown("second"))
+        self.assertEqual(state.shutdown_source, "first")
+
+    def test_no_reconnect_after_keyboard_shutdown(self):
+        packets: queue.Queue = queue.Queue()
+        state = RecorderState(threading.Event(), mock.Mock(), RecorderStats())
+        camera = CameraDevice("dshow", "DECXIN CAMERA", "DECXIN CAMERA", "", "mjpeg")
+
+        class KeyboardShutdownPopen:
+            def __init__(self, command, stdout=None, creationflags=0):
+                self.stdout = ShutdownDuringCaptureRead(state)
+
+            def terminate(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                return None
+
+        with mock.patch("rfid_tracking.recording.ffmpeg_recorder.subprocess.Popen", KeyboardShutdownPopen):
+            with mock.patch("rfid_tracking.recording.ffmpeg_recorder.discover_camera") as discover:
+                keyboard_stop_thread(state, io.StringIO("q\n"))
+                capture_thread(
+                    packets=packets,
+                    state=state,
+                    requested_device="DECXIN CAMERA",
+                    requested_backend="dshow",
+                    camera=camera,
+                    width=1,
+                    height=1,
+                    fps=30.0,
+                )
+        discover.assert_not_called()
+
+    def test_no_reconnect_after_stop_file_shutdown(self):
+        packets: queue.Queue = queue.Queue()
+        state = RecorderState(threading.Event(), mock.Mock(), RecorderStats())
+        camera = CameraDevice("dshow", "DECXIN CAMERA", "DECXIN CAMERA", "", "mjpeg")
+        with tempfile.TemporaryDirectory() as tmp:
+            stop_file = Path(tmp) / "STOP_RECORDING"
+            stop_file.write_text("stop\n", encoding="utf-8")
+            stop_file_watcher_thread(state, stop_file, interval_s=0.001)
+        with mock.patch("rfid_tracking.recording.ffmpeg_recorder.discover_camera") as discover:
+            capture_thread(
+                packets=packets,
+                state=state,
+                requested_device="DECXIN CAMERA",
+                requested_backend="dshow",
+                camera=camera,
+                width=1,
+                height=1,
+                fps=30.0,
+            )
+        discover.assert_not_called()
 
     def test_successful_eof_based_ffmpeg_shutdown(self):
         with tempfile.TemporaryDirectory() as tmp:

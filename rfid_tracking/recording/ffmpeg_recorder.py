@@ -77,18 +77,23 @@ class RecorderState:
     failure_event: threading.Event
     stats: RecorderStats
     error_message: str | None = None
+    shutdown_source: str | None = None
 
     @property
     def shutdown_requested(self) -> threading.Event:
         return self.stop_event
 
-    def request_shutdown(self) -> None:
+    def request_shutdown(self, source: str = "unknown") -> bool:
+        first_request = not self.shutdown_requested.is_set()
+        if first_request:
+            self.shutdown_source = source
         self.shutdown_requested.set()
+        return first_request
 
     def fail(self, message: str) -> None:
         self.error_message = message
         self.failure_event.set()
-        self.request_shutdown()
+        self.request_shutdown(f"failure: {message}")
 
 
 def configure_logging(output_dir: Path) -> Path:
@@ -164,6 +169,65 @@ def log_clock_diagnostics(expected_offset: str | None) -> None:
             current_offset,
             expected_offset,
         )
+
+
+STOP_COMMANDS = {"q", "stop", "quit", "exit"}
+
+
+def default_stop_file(output_dir: Path) -> Path:
+    return output_dir / "STOP_RECORDING"
+
+
+def should_enable_keyboard_stop(requested: bool | None) -> bool:
+    if requested is not None:
+        return requested
+    return sys.stdin is not None and sys.stdin.isatty()
+
+
+def print_stop_instructions(output_dir: Path) -> None:
+    print("Recording started.")
+    print("Type q and press Enter to stop safely.")
+    print("Alternative from another PowerShell:")
+    print(
+        "python -m rfid_tracking.recording.ffmpeg_recorder --request-stop "
+        f'--output-dir "{output_dir}"'
+    )
+
+
+def keyboard_stop_thread(state: RecorderState, input_stream=None) -> None:
+    stream = input_stream if input_stream is not None else sys.stdin
+    while not state.shutdown_requested.is_set():
+        line = stream.readline()
+        if line == "":
+            return
+        command = line.strip().lower()
+        if command in STOP_COMMANDS:
+            if state.request_shutdown(f"keyboard {command} command"):
+                LOGGER.info("Shutdown requested by keyboard command, disabling capture recovery")
+            return
+
+
+def stop_file_watcher_thread(state: RecorderState, stop_file: Path, interval_s: float = 0.25) -> None:
+    while not state.shutdown_requested.is_set():
+        if stop_file.exists():
+            if state.request_shutdown(f"stop file {stop_file}"):
+                LOGGER.info("Shutdown requested by stop file, disabling capture recovery")
+            try:
+                stop_file.rename(stop_file.with_suffix(stop_file.suffix + ".handled"))
+            except OSError:
+                try:
+                    stop_file.unlink()
+                except OSError:
+                    LOGGER.warning("Could not remove stop file %s", stop_file)
+            return
+        state.shutdown_requested.wait(interval_s)
+
+
+def request_stop_file(output_dir: Path, stop_file: Path | None = None) -> Path:
+    path = stop_file or default_stop_file(output_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("stop\n", encoding="utf-8")
+    return path
 
 
 class SegmentWriter:
@@ -711,6 +775,7 @@ def run_recording(args: argparse.Namespace) -> int:
         failure_event=threading.Event(),
         stats=RecorderStats(),
     )
+    stop_file = args.stop_file or default_stop_file(output_dir)
     packets: "queue.Queue[FramePacket | object]" = queue.Queue(maxsize=args.queue_size)
     segment_writer = SegmentWriter(
         output_dir=output_dir,
@@ -724,13 +789,28 @@ def run_recording(args: argparse.Namespace) -> int:
     )
 
     def request_stop(_signum: int, _frame: object) -> None:
-        LOGGER.info("Shutdown requested, disabling capture recovery")
-        state.request_shutdown()
+        if state.request_shutdown("console signal"):
+            LOGGER.info("Shutdown requested, disabling capture recovery")
 
     previous_sigint = signal.signal(signal.SIGINT, request_stop)
     previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
     previous_sigbreak = signal.signal(signal.SIGBREAK, request_stop) if hasattr(signal, "SIGBREAK") else None
     try:
+        print_stop_instructions(output_dir)
+        helpers: list[threading.Thread] = []
+        if should_enable_keyboard_stop(args.keyboard_stop):
+            helper = threading.Thread(target=keyboard_stop_thread, args=(state,), daemon=True)
+            helper.start()
+            helpers.append(helper)
+        else:
+            LOGGER.info("Keyboard stop disabled because stdin is not interactive")
+        stop_helper = threading.Thread(
+            target=stop_file_watcher_thread,
+            args=(state, stop_file),
+            daemon=True,
+        )
+        stop_helper.start()
+        helpers.append(stop_helper)
         writer = threading.Thread(target=writer_thread, kwargs={"packets": packets, "state": state, "writer": segment_writer})
         if args.synthetic:
             capture = threading.Thread(
@@ -763,6 +843,7 @@ def run_recording(args: argparse.Namespace) -> int:
         capture.start()
         capture.join()
         writer.join()
+        state.request_shutdown("recording complete")
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
         signal.signal(signal.SIGTERM, previous_sigterm)
@@ -798,6 +879,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--list-devices", action="store_true")
     parser.add_argument("--list-camera-controls", action="store_true")
     parser.add_argument("--recover-partials", action="store_true")
+    parser.add_argument("--request-stop", action="store_true")
+    keyboard_group = parser.add_mutually_exclusive_group()
+    keyboard_group.add_argument("--keyboard-stop", dest="keyboard_stop", action="store_true")
+    keyboard_group.add_argument("--no-keyboard-stop", dest="keyboard_stop", action="store_false")
+    parser.set_defaults(keyboard_stop=None)
+    parser.add_argument("--stop-file", type=Path)
     parser.add_argument("--camera-controls-config")
     parser.add_argument("--expected-timezone-offset", default="+08:00")
     parser.add_argument("--skip-validation", action="store_true")
@@ -824,6 +911,10 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
+    if args.request_stop:
+        path = request_stop_file(args.output_dir, args.stop_file)
+        print(f"Stop requested via {path}")
+        return 0
     if args.synthetic and args.duration_seconds <= 0:
         parser.error("--synthetic requires --duration-seconds greater than 0")
     try:
