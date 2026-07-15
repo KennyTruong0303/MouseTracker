@@ -49,6 +49,9 @@ class CameraDevice:
     name: str
     formats_text: str
     preferred_input_format: str
+    width: int | None = None
+    height: int | None = None
+    fps: float | None = None
 
 
 def resolve_backend(requested: str) -> Backend:
@@ -225,6 +228,25 @@ def _fps_values_from_dshow_line(line: str) -> list[float]:
 
 
 def _dshow_line_has_exact_mode(line: str, width: int, height: int, fps: float) -> bool:
+    range_match = re.search(
+        r"min\s+s=(\d+)x(\d+)\s+fps=(\d+(?:\.\d+)?)\s+max\s+s=(\d+)x(\d+)\s+fps=(\d+(?:\.\d+)?)",
+        line,
+    )
+    if range_match:
+        min_width = int(range_match.group(1))
+        min_height = int(range_match.group(2))
+        min_fps = float(range_match.group(3))
+        max_width = int(range_match.group(4))
+        max_height = int(range_match.group(5))
+        max_fps = float(range_match.group(6))
+        return (
+            min_width == width
+            and max_width == width
+            and min_height == height
+            and max_height == height
+            and min_fps <= fps <= max_fps
+        )
+
     size = f"{width}x{height}"
     if size not in line:
         return False
@@ -283,6 +305,9 @@ def discover_dshow_camera(
                 name=name,
                 formats_text=options,
                 preferred_input_format=input_format,
+                width=width,
+                height=height,
+                fps=fps,
             )
         rejected.append(f"{name}: does not expose exactly {width}x{height} at {fps:g} fps")
 
@@ -409,4 +434,3 @@ def apply_controls(
         command = ["v4l2-ctl", "-d", device, f"--set-ctrl={name}={value}"]
         run_text(command, runner=runner)
         LOGGER.info("Applied camera control %s=%s", name, value)
-

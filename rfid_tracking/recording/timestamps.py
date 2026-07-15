@@ -136,23 +136,31 @@ class TimestampCsvWriter:
         self.path = path
         self.flush_every = flush_every
         self.rows_written = 0
+        self._closed = False
         self._handle = path.open("w", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(self._handle, fieldnames=CSV_COLUMNS)
         self._writer.writeheader()
 
     def write_row(self, row: dict[str, object]) -> None:
+        if self._closed:
+            raise ValueError(f"Cannot write to closed CSV file {self.path}")
         self._writer.writerow(row)
         self.rows_written += 1
         if self.rows_written % self.flush_every == 0:
             self.flush()
 
     def flush(self) -> None:
+        if self._closed:
+            return
         self._handle.flush()
         os.fsync(self._handle.fileno())
 
     def close(self) -> None:
+        if self._closed:
+            return
         self.flush()
         self._handle.close()
+        self._closed = True
 
     def __enter__(self) -> "TimestampCsvWriter":
         return self
@@ -170,4 +178,3 @@ def count_csv_rows(path: Path) -> int:
 def iter_csv_rows(path: Path) -> Iterable[dict[str, str]]:
     with path.open("r", newline="", encoding="utf-8") as handle:
         yield from csv.DictReader(handle)
-

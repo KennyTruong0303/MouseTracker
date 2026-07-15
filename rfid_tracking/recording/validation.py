@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,17 @@ class SegmentValidation:
     video_frames: int | None
     csv_rows: int
     errors: list[str]
+
+
+@dataclass(frozen=True)
+class PartialRecovery:
+    ok: bool
+    part_video: Path
+    part_csv: Path
+    final_video: Path
+    final_csv: Path
+    validation: SegmentValidation
+    promoted: bool
 
 
 def _ffprobe_json(video_path: Path, runner: Runner = subprocess.run) -> dict:
@@ -66,6 +78,7 @@ def validate_segment(
     width: int,
     height: int,
     fps: float,
+    mark_invalid: bool = True,
     runner: Runner = subprocess.run,
 ) -> SegmentValidation:
     errors: list[str] = []
@@ -119,8 +132,68 @@ def validate_segment(
         csv_rows=csv_rows,
         errors=errors,
     )
-    if not result.ok:
+    if mark_invalid and not result.ok:
         marker = video_path.with_suffix(video_path.suffix + ".invalid")
         marker.write_text("\n".join(errors) + "\n", encoding="utf-8")
     return result
 
+
+def final_paths_for_partial(part_video: Path) -> tuple[Path, Path]:
+    if not part_video.name.endswith(".part.mp4"):
+        raise ValueError(f"Expected a .part.mp4 file, got {part_video}")
+    stem = part_video.name.removesuffix(".part.mp4")
+    return part_video.with_name(f"{stem}.mp4"), part_video.with_name(f"{stem}_timestamps.csv")
+
+
+def csv_path_for_partial_video(part_video: Path) -> Path:
+    if not part_video.name.endswith(".part.mp4"):
+        raise ValueError(f"Expected a .part.mp4 file, got {part_video}")
+    stem = part_video.name.removesuffix(".part.mp4")
+    return part_video.with_name(f"{stem}_timestamps.part.csv")
+
+
+def recover_partial_segment(
+    part_video: Path,
+    *,
+    width: int,
+    height: int,
+    fps: float,
+    runner: Runner = subprocess.run,
+) -> PartialRecovery:
+    part_csv = csv_path_for_partial_video(part_video)
+    final_video, final_csv = final_paths_for_partial(part_video)
+    validation = validate_segment(
+        part_video,
+        part_csv,
+        width=width,
+        height=height,
+        fps=fps,
+        mark_invalid=True,
+        runner=runner,
+    )
+    if validation.ok:
+        os.replace(part_video, final_video)
+        os.replace(part_csv, final_csv)
+    return PartialRecovery(
+        ok=validation.ok,
+        part_video=part_video,
+        part_csv=part_csv,
+        final_video=final_video,
+        final_csv=final_csv,
+        validation=validation,
+        promoted=validation.ok,
+    )
+
+
+def recover_partials_in_dir(
+    output_dir: Path,
+    *,
+    width: int,
+    height: int,
+    fps: float,
+    runner: Runner = subprocess.run,
+) -> list[PartialRecovery]:
+    return [
+        recover_partial_segment(part_video, width=width, height=height, fps=fps, runner=runner)
+        for part_video in sorted(output_dir.glob("record_*.part.mp4"))
+    ]

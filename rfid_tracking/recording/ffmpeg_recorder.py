@@ -13,6 +13,8 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
@@ -42,13 +44,20 @@ from .timestamps import (
     segment_paths,
     timestamp_row,
 )
-from .validation import validate_segment
+from .validation import recover_partial_segment, recover_partials_in_dir, validate_segment
 
 
 LOGGER = logging.getLogger("rfid_tracking.recording")
 DEFAULT_OUTPUT_DIR = Path(r"D:\MouseTracker\data\mota") if os.name == "nt" else Path("/mnt/d/MouseTracker/data/mota")
 SENTINEL = object()
 SEGMENT_BREAK = object()
+
+
+class SegmentState(Enum):
+    OPEN = "OPEN"
+    FINALIZING = "FINALIZING"
+    FINALIZED = "FINALIZED"
+    FAILED = "FAILED"
 
 
 @dataclass
@@ -69,10 +78,17 @@ class RecorderState:
     stats: RecorderStats
     error_message: str | None = None
 
+    @property
+    def shutdown_requested(self) -> threading.Event:
+        return self.stop_event
+
+    def request_shutdown(self) -> None:
+        self.shutdown_requested.set()
+
     def fail(self, message: str) -> None:
         self.error_message = message
         self.failure_event.set()
-        self.stop_event.set()
+        self.request_shutdown()
 
 
 def configure_logging(output_dir: Path) -> Path:
@@ -124,6 +140,32 @@ def print_table(rows: Iterable[tuple[str, bool, str]]) -> None:
         print(f"{name:<{width}}  {'PASS' if ok else 'FAIL'}  {detail}")
 
 
+def timezone_offset_string() -> str:
+    offset = datetime.now().astimezone().utcoffset()
+    if offset is None:
+        return "unknown"
+    total_seconds = int(offset.total_seconds())
+    sign = "+" if total_seconds >= 0 else "-"
+    total_seconds = abs(total_seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes = remainder // 60
+    return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+def log_clock_diagnostics(expected_offset: str | None) -> None:
+    now = datetime.now().astimezone()
+    current_offset = timezone_offset_string()
+    LOGGER.info("Windows/local time at recording start: %s", now.isoformat())
+    LOGGER.info("Local timezone names: %s", time.tzname)
+    LOGGER.info("Local UTC offset: %s", current_offset)
+    if expected_offset and current_offset != expected_offset:
+        LOGGER.warning(
+            "Local timezone offset %s does not match expected experimental clock offset %s",
+            current_offset,
+            expected_offset,
+        )
+
+
 class SegmentWriter:
     def __init__(
         self,
@@ -153,12 +195,18 @@ class SegmentWriter:
         self.segment_frame_index = 0
         self.previous_frame_monotonic_ns: int | None = None
         self.encoded_frames = 0
+        self.state = SegmentState.FINALIZED
+        self._stdin_closed = False
 
     def open_for_packet(self, packet: FramePacket) -> None:
+        if self.state == SegmentState.FINALIZING:
+            raise RuntimeError("Cannot open a segment while another segment is finalizing")
         self.paths = segment_paths(self.output_dir, packet.wall_time_unix_ns)
         self.segment_start_monotonic_ns = packet.monotonic_ns
         self.segment_frame_index = 0
         self.encoded_frames = 0
+        self._stdin_closed = False
+        self.state = SegmentState.OPEN
         command = build_encode_command(
             encoder=self.encoder,
             output_path=self.paths.part_video,
@@ -168,7 +216,13 @@ class SegmentWriter:
         )
         LOGGER.info("Opening segment %s", self.paths.segment_filename)
         LOGGER.info("Encoder command: %s", " ".join(command))
-        self.process = subprocess.Popen(command, stdin=subprocess.PIPE)
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+        )
         self.csv = TimestampCsvWriter(self.paths.part_csv)
 
     def write_packet(self, packet: FramePacket, stats: RecorderStats) -> None:
@@ -222,41 +276,101 @@ class SegmentWriter:
         self.encoded_frames += 1
 
     def finalize_current(self, stats: RecorderStats) -> None:
-        if self.paths is None:
+        if self.paths is None or self.state in {SegmentState.FINALIZED, SegmentState.FAILED}:
+            return
+        if self.state == SegmentState.FINALIZING:
+            LOGGER.warning("Ignoring repeated finalize_current call while segment is already finalizing")
             return
         assert self.process is not None
         assert self.csv is not None
-        assert self.process.stdin is not None
         paths = self.paths
+        self.state = SegmentState.FINALIZING
         LOGGER.info("Closing segment %s with %s frames", paths.segment_filename, self.encoded_frames)
+        returncode: int | None = None
+        stderr_text = ""
         try:
-            self.process.stdin.close()
-            returncode = self.process.wait(timeout=60)
-        finally:
-            self.csv.close()
-        if returncode != 0:
-            raise RuntimeError(f"FFmpeg encoder exited with code {returncode} for {paths.part_video}")
-        os.replace(paths.part_video, paths.final_video)
-        os.replace(paths.part_csv, paths.final_csv)
-        stats.segments.append(paths.final_video)
-        if self.validate:
-            result = validate_segment(
-                paths.final_video,
-                paths.final_csv,
-                width=self.width,
-                height=self.height,
-                fps=self.fps,
-            )
-            if result.ok:
-                LOGGER.info("Validated segment %s", paths.final_video.name)
-            else:
-                LOGGER.error("Invalid segment %s: %s", paths.final_video.name, "; ".join(result.errors))
+            try:
+                if self.process.stdin is not None and not self._stdin_closed:
+                    self.process.stdin.close()
+                    self._stdin_closed = True
+                returncode = self.process.wait(timeout=60)
+                stderr_text = self._read_encoder_stderr()
+            finally:
+                self.csv.close()
+
+            if returncode != 0:
+                LOGGER.error(
+                    "FFmpeg encoder exited with code %s for %s\n%s",
+                    returncode,
+                    paths.part_video,
+                    stderr_text.strip(),
+                )
+                if self.validate:
+                    recovery = recover_partial_segment(
+                        paths.part_video,
+                        width=self.width,
+                        height=self.height,
+                        fps=self.fps,
+                    )
+                    if recovery.ok:
+                        LOGGER.warning(
+                            "Recovered valid segment after non-zero FFmpeg exit: %s",
+                            recovery.final_video.name,
+                        )
+                        stats.segments.append(recovery.final_video)
+                        self._mark_finalized_and_reset()
+                        return
+                    LOGGER.error(
+                        "Partial segment was not recoverable: %s",
+                        "; ".join(recovery.validation.errors),
+                    )
+                self.state = SegmentState.FAILED
+                raise RuntimeError(f"FFmpeg encoder exited with code {returncode} for {paths.part_video}")
+
+            if self.validate:
+                result = validate_segment(
+                    paths.part_video,
+                    paths.part_csv,
+                    width=self.width,
+                    height=self.height,
+                    fps=self.fps,
+                )
+                if not result.ok:
+                    self.state = SegmentState.FAILED
+                    raise RuntimeError(
+                        f"Segment validation failed for {paths.part_video}: {'; '.join(result.errors)}"
+                    )
+
+            os.replace(paths.part_video, paths.final_video)
+            os.replace(paths.part_csv, paths.final_csv)
+            stats.segments.append(paths.final_video)
+            LOGGER.info("Finalized segment %s", paths.final_video.name)
+            self._mark_finalized_and_reset()
+        except Exception:
+            if self.state != SegmentState.FINALIZED:
+                self.state = SegmentState.FAILED
+            raise
+
+    def _read_encoder_stderr(self) -> str:
+        if self.process is None or self.process.stderr is None:
+            return ""
+        try:
+            data = self.process.stderr.read()
+        except Exception as exc:  # noqa: BLE001
+            return f"<failed to read encoder stderr: {exc}>"
+        if isinstance(data, bytes):
+            return data.decode("utf-8", errors="replace")
+        return str(data)
+
+    def _mark_finalized_and_reset(self) -> None:
+        self.state = SegmentState.FINALIZED
         self.paths = None
         self.process = None
         self.csv = None
         self.segment_start_monotonic_ns = None
         self.segment_frame_index = 0
         self.encoded_frames = 0
+        self._stdin_closed = False
 
 
 def read_exact(stream, size: int) -> bytes:
@@ -280,7 +394,7 @@ def capture_command(camera: CameraDevice, width: int, height: int, fps: float) -
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
-            "error",
+            "warning",
             "-f",
             "dshow",
             *input_args,
@@ -290,11 +404,12 @@ def capture_command(camera: CameraDevice, width: int, height: int, fps: float) -
             str(fps),
             "-i",
             f"video={camera.name}",
-            "-f",
-            "rawvideo",
+            "-an",
             "-pix_fmt",
             "bgr24",
-            "-",
+            "-f",
+            "rawvideo",
+            "pipe:1",
         ]
     return [
         "ffmpeg",
@@ -351,21 +466,33 @@ def capture_thread(
     index = 0
     retry_delay = 1.0
     try:
-        while not state.stop_event.is_set():
+        while not state.shutdown_requested.is_set():
             command = capture_command(camera, width, height, fps)
             LOGGER.info("Capture command: %s", " ".join(command))
-            process = subprocess.Popen(command, stdout=subprocess.PIPE)
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, creationflags=creationflags)
+            capture_failed = False
             try:
                 assert process.stdout is not None
-                while not state.stop_event.is_set():
+                while not state.shutdown_requested.is_set():
                     data = read_exact(process.stdout, frame_bytes)
                     if len(data) == 0:
-                        LOGGER.error("Capture FFmpeg ended unexpectedly; closing current segment")
+                        if state.shutdown_requested.is_set():
+                            LOGGER.info("Capture FFmpeg ended after shutdown request; closing current segment")
+                        else:
+                            capture_failed = True
+                            LOGGER.error("Capture FFmpeg ended unexpectedly; closing current segment")
                         packets.put(SEGMENT_BREAK)
                         break
                     if len(data) != frame_bytes:
                         state.stats.incomplete_frames += 1
-                        LOGGER.error("Incomplete frame buffer: %s of %s bytes", len(data), frame_bytes)
+                        if state.shutdown_requested.is_set():
+                            LOGGER.info(
+                                "Incomplete frame received after shutdown request; closing current segment"
+                            )
+                        else:
+                            capture_failed = True
+                            LOGGER.error("Incomplete frame buffer: %s of %s bytes", len(data), frame_bytes)
                         packets.put(SEGMENT_BREAK)
                         break
                     wall_ns = time.time_ns()
@@ -380,10 +507,16 @@ def capture_thread(
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     process.kill()
-            if state.stop_event.is_set():
+            if state.shutdown_requested.is_set():
+                LOGGER.info("Shutdown requested, disabling capture recovery")
+                break
+            if not capture_failed:
                 break
             LOGGER.info("Retrying camera discovery after %.1f seconds", retry_delay)
             time.sleep(retry_delay)
+            if state.shutdown_requested.is_set():
+                LOGGER.info("Shutdown requested, disabling capture recovery")
+                break
             retry_delay = min(retry_delay * 2, 30.0)
             try:
                 camera = discover_camera(
@@ -401,7 +534,7 @@ def capture_thread(
         LOGGER.exception("Capture thread failed")
         state.fail(f"Capture thread failed: {exc}")
     finally:
-        state.stop_event.set()
+        state.request_shutdown()
         packets.put(SENTINEL)
 
 
@@ -421,7 +554,7 @@ def synthetic_capture_thread(
     frame = bytes(width * height * 3)
     try:
         for index in range(total_frames):
-            if state.stop_event.is_set():
+            if state.shutdown_requested.is_set():
                 break
             packet = FramePacket(
                 data=frame,
@@ -435,7 +568,7 @@ def synthetic_capture_thread(
         LOGGER.exception("Synthetic capture failed")
         state.fail(f"Synthetic capture failed: {exc}")
     finally:
-        state.stop_event.set()
+        state.request_shutdown()
         packets.put(SENTINEL)
 
 
@@ -466,10 +599,6 @@ def writer_thread(
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Writer thread failed")
         state.fail(f"Writer thread failed: {exc}")
-        try:
-            writer.finalize_current(state.stats)
-        except Exception:
-            LOGGER.exception("Failed while finalizing after writer error")
 
 
 def preflight(args: argparse.Namespace) -> int:
@@ -495,7 +624,14 @@ def preflight(args: argparse.Namespace) -> int:
                 fps=args.fps,
                 backend=backend,
             )
-            rows.append(("camera", True, f"{camera.backend} {camera.name} {camera.preferred_input_format}"))
+            rows.append(
+                (
+                    "camera",
+                    True,
+                    f"{camera.backend} {camera.name} {camera.preferred_input_format} "
+                    f"{args.width}x{args.height}@{args.fps:g}",
+                )
+            )
         except Exception as exc:  # noqa: BLE001
             detail = str(exc)
             if "No V4L2 camera" in detail:
@@ -509,12 +645,36 @@ def preflight(args: argparse.Namespace) -> int:
     return 0 if all(ok for _name, ok, _detail in rows) else 1
 
 
+def recover_partials(args: argparse.Namespace) -> int:
+    results = recover_partials_in_dir(
+        args.output_dir,
+        width=args.width,
+        height=args.height,
+        fps=args.fps,
+    )
+    if not results:
+        print(f"No .part MP4 files found in {args.output_dir}")
+        return 0
+    ok = True
+    for result in results:
+        if result.ok:
+            print(f"RECOVERED {result.final_video.name} and {result.final_csv.name}")
+        else:
+            ok = False
+            print(
+                f"FAILED {result.part_video.name}: "
+                + "; ".join(result.validation.errors)
+            )
+    return 0 if ok else 1
+
+
 def run_recording(args: argparse.Namespace) -> int:
     output_dir = args.output_dir
     backend = resolve_backend(args.backend)
     log_path = configure_logging(output_dir)
     LOGGER.info("FFmpeg: %s", ffmpeg_version())
     LOGGER.info("Camera backend: %s", backend)
+    log_clock_diagnostics(args.expected_timezone_offset)
     selected_encoder = select_hevc_encoder(args.encoder, backend=backend)
     for result in selected_encoder.probe_results:
         LOGGER.info(
@@ -564,11 +724,12 @@ def run_recording(args: argparse.Namespace) -> int:
     )
 
     def request_stop(_signum: int, _frame: object) -> None:
-        LOGGER.info("Shutdown requested")
-        state.stop_event.set()
+        LOGGER.info("Shutdown requested, disabling capture recovery")
+        state.request_shutdown()
 
     previous_sigint = signal.signal(signal.SIGINT, request_stop)
     previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
+    previous_sigbreak = signal.signal(signal.SIGBREAK, request_stop) if hasattr(signal, "SIGBREAK") else None
     try:
         writer = threading.Thread(target=writer_thread, kwargs={"packets": packets, "state": state, "writer": segment_writer})
         if args.synthetic:
@@ -605,6 +766,8 @@ def run_recording(args: argparse.Namespace) -> int:
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
         signal.signal(signal.SIGTERM, previous_sigterm)
+        if previous_sigbreak is not None:
+            signal.signal(signal.SIGBREAK, previous_sigbreak)
 
     LOGGER.info("Recording stopped. Run log: %s", log_path)
     LOGGER.info("Queue high-water mark: %s", state.stats.queue_high_water_mark)
@@ -634,7 +797,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preflight", action="store_true")
     parser.add_argument("--list-devices", action="store_true")
     parser.add_argument("--list-camera-controls", action="store_true")
+    parser.add_argument("--recover-partials", action="store_true")
     parser.add_argument("--camera-controls-config")
+    parser.add_argument("--expected-timezone-offset", default="+08:00")
     parser.add_argument("--skip-validation", action="store_true")
     return parser
 
@@ -652,6 +817,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.preflight:
         return preflight(args)
+    if args.recover_partials:
+        try:
+            require_tool("ffprobe")
+            return recover_partials(args)
+        except Exception as exc:  # noqa: BLE001
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
     if args.synthetic and args.duration_seconds <= 0:
         parser.error("--synthetic requires --duration-seconds greater than 0")
     try:
