@@ -1,4 +1,4 @@
-"""WSL2 FFmpeg webcam recorder with per-frame timestamp CSV files."""
+"""FFmpeg webcam recorder with per-frame timestamp CSV files."""
 
 from __future__ import annotations
 
@@ -17,12 +17,15 @@ from pathlib import Path
 from typing import Iterable
 
 from .camera import (
+    CameraDevice,
+    DSHOW_CAMERA_DIAGNOSTIC,
     WSL_CAMERA_DIAGNOSTIC,
     apply_controls,
     discover_camera,
     list_camera_devices,
     list_controls,
     load_control_config,
+    resolve_backend,
     warn_about_auto_controls,
 )
 from .encoder import (
@@ -43,7 +46,7 @@ from .validation import validate_segment
 
 
 LOGGER = logging.getLogger("rfid_tracking.recording")
-DEFAULT_OUTPUT_DIR = Path("/mnt/d/MouseTracker/data/mota")
+DEFAULT_OUTPUT_DIR = Path(r"D:\MouseTracker\data\mota") if os.name == "nt" else Path("/mnt/d/MouseTracker/data/mota")
 SENTINEL = object()
 SEGMENT_BREAK = object()
 
@@ -88,9 +91,12 @@ def configure_logging(output_dir: Path) -> Path:
     return log_path
 
 
-def ensure_tools() -> list[tuple[str, bool, str]]:
+def ensure_tools(*, backend: str, include_camera_tools: bool) -> list[tuple[str, bool, str]]:
     checks = []
-    for tool in ("ffmpeg", "ffprobe", "v4l2-ctl"):
+    tools = ["ffmpeg", "ffprobe"]
+    if include_camera_tools and backend == "v4l2":
+        tools.append("v4l2-ctl")
+    for tool in tools:
         path = shutil.which(tool)
         checks.append((tool, bool(path), path or "not found"))
     return checks
@@ -263,7 +269,33 @@ def read_exact(stream, size: int) -> bytes:
     return bytes(parts)
 
 
-def capture_command(device_path: str, input_format: str, width: int, height: int, fps: float) -> list[str]:
+def capture_command(camera: CameraDevice, width: int, height: int, fps: float) -> list[str]:
+    if camera.backend == "dshow":
+        input_args = (
+            ["-vcodec", "mjpeg"]
+            if camera.preferred_input_format == "mjpeg"
+            else ["-pixel_format", camera.preferred_input_format]
+        )
+        return [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "dshow",
+            *input_args,
+            "-video_size",
+            f"{width}x{height}",
+            "-framerate",
+            str(fps),
+            "-i",
+            f"video={camera.name}",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-",
+        ]
     return [
         "ffmpeg",
         "-hide_banner",
@@ -272,13 +304,13 @@ def capture_command(device_path: str, input_format: str, width: int, height: int
         "-f",
         "v4l2",
         "-input_format",
-        input_format,
+        camera.preferred_input_format,
         "-video_size",
         f"{width}x{height}",
         "-framerate",
         str(fps),
         "-i",
-        device_path,
+        camera.path,
         "-f",
         "rawvideo",
         "-pix_fmt",
@@ -309,8 +341,8 @@ def capture_thread(
     packets: "queue.Queue[FramePacket | object]",
     state: RecorderState,
     requested_device: str,
-    device_path: str,
-    input_format: str,
+    requested_backend: str,
+    camera: CameraDevice,
     width: int,
     height: int,
     fps: float,
@@ -320,7 +352,7 @@ def capture_thread(
     retry_delay = 1.0
     try:
         while not state.stop_event.is_set():
-            command = capture_command(device_path, input_format, width, height, fps)
+            command = capture_command(camera, width, height, fps)
             LOGGER.info("Capture command: %s", " ".join(command))
             process = subprocess.Popen(command, stdout=subprocess.PIPE)
             try:
@@ -354,11 +386,15 @@ def capture_thread(
             time.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 30.0)
             try:
-                camera = discover_camera(device=requested_device, width=width, height=height, fps=fps)
-                device_path = camera.path
-                input_format = camera.preferred_input_format
+                camera = discover_camera(
+                    device=requested_device,
+                    width=width,
+                    height=height,
+                    fps=fps,
+                    backend=requested_backend,
+                )
                 retry_delay = 1.0
-                LOGGER.info("Reconnected camera: %s %s", camera.path, camera.name)
+                LOGGER.info("Reconnected camera: %s %s", camera.backend, camera.name)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.error("Camera rediscovery failed: %s", exc)
     except Exception as exc:  # noqa: BLE001 - worker failures must reach main thread.
@@ -438,23 +474,34 @@ def writer_thread(
 
 def preflight(args: argparse.Namespace) -> int:
     rows: list[tuple[str, bool, str]] = []
-    for tool, ok, detail in ensure_tools():
+    backend = resolve_backend(args.backend)
+    for tool, ok, detail in ensure_tools(backend=backend, include_camera_tools=not args.synthetic):
         rows.append((tool, ok, detail))
     out_ok, out_detail = check_output_dir(args.output_dir)
     rows.append(("output dir", out_ok, out_detail))
     if out_ok:
         rows.append(("disk free", disk_free_bytes(args.output_dir) > 5_000_000_000, f"{disk_free_bytes(args.output_dir)} bytes"))
     try:
-        selected = select_hevc_encoder(args.encoder)
+        selected = select_hevc_encoder(args.encoder, backend=backend)
         rows.append(("HEVC encoder", True, selected.name))
     except Exception as exc:  # noqa: BLE001
         rows.append(("HEVC encoder", False, str(exc)))
     if not args.synthetic:
         try:
-            camera = discover_camera(device=args.device, width=args.width, height=args.height, fps=args.fps)
-            rows.append(("camera", True, f"{camera.path} {camera.name} {camera.preferred_input_format}"))
+            camera = discover_camera(
+                device=args.device,
+                width=args.width,
+                height=args.height,
+                fps=args.fps,
+                backend=backend,
+            )
+            rows.append(("camera", True, f"{camera.backend} {camera.name} {camera.preferred_input_format}"))
         except Exception as exc:  # noqa: BLE001
-            detail = WSL_CAMERA_DIAGNOSTIC if "No V4L2 camera" in str(exc) else str(exc)
+            detail = str(exc)
+            if "No V4L2 camera" in detail:
+                detail = WSL_CAMERA_DIAGNOSTIC
+            if "No DirectShow" in detail:
+                detail = DSHOW_CAMERA_DIAGNOSTIC
             rows.append(("camera", False, detail.replace("\n", " ")))
     frame_bytes = args.width * args.height * 3
     rows.append(("raw frame size", frame_bytes == args.width * args.height * 3, f"{frame_bytes} bytes"))
@@ -464,9 +511,11 @@ def preflight(args: argparse.Namespace) -> int:
 
 def run_recording(args: argparse.Namespace) -> int:
     output_dir = args.output_dir
+    backend = resolve_backend(args.backend)
     log_path = configure_logging(output_dir)
     LOGGER.info("FFmpeg: %s", ffmpeg_version())
-    selected_encoder = select_hevc_encoder(args.encoder)
+    LOGGER.info("Camera backend: %s", backend)
+    selected_encoder = select_hevc_encoder(args.encoder, backend=backend)
     for result in selected_encoder.probe_results:
         LOGGER.info(
             "Encoder probe %s ok=%s rc=%s stderr=%s",
@@ -479,14 +528,23 @@ def run_recording(args: argparse.Namespace) -> int:
     camera = None
     controls_text = ""
     if not args.synthetic:
-        camera = discover_camera(device=args.device, width=args.width, height=args.height, fps=args.fps)
-        controls_text = list_controls(camera.path)
-        LOGGER.info("Selected camera: %s %s", camera.path, camera.name)
+        camera = discover_camera(
+            device=args.device,
+            width=args.width,
+            height=args.height,
+            fps=args.fps,
+            backend=backend,
+        )
+        controls_text = list_controls(camera.path, backend=backend)
+        LOGGER.info("Selected camera: %s %s", camera.backend, camera.name)
         LOGGER.info("Camera input format: %s", camera.preferred_input_format)
-        LOGGER.info("Camera controls:\n%s", controls_text)
-        for warning in warn_about_auto_controls(controls_text):
-            LOGGER.warning(warning)
-        apply_controls(camera.path, load_control_config(args.camera_controls_config))
+        LOGGER.info("Camera options/controls:\n%s", controls_text)
+        if backend == "v4l2":
+            for warning in warn_about_auto_controls(controls_text):
+                LOGGER.warning(warning)
+            apply_controls(camera.path, load_control_config(args.camera_controls_config), backend=backend)
+        elif args.camera_controls_config:
+            raise RuntimeError("--camera-controls-config is only supported with --backend v4l2")
 
     state = RecorderState(
         stop_event=threading.Event(),
@@ -533,8 +591,8 @@ def run_recording(args: argparse.Namespace) -> int:
                     "packets": packets,
                     "state": state,
                     "requested_device": args.device,
-                    "device_path": camera.path,
-                    "input_format": camera.preferred_input_format,
+                    "requested_backend": backend,
+                    "camera": camera,
                     "width": args.width,
                     "height": args.height,
                     "fps": args.fps,
@@ -562,6 +620,7 @@ def run_recording(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--backend", choices=("auto", "dshow", "v4l2"), default="auto")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
@@ -584,11 +643,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.list_devices:
-        print(list_camera_devices(args.width, args.height, args.fps))
+        print(list_camera_devices(args.width, args.height, args.fps, backend=args.backend))
         return 0
     if args.list_camera_controls:
-        camera = discover_camera(device=args.device, width=args.width, height=args.height, fps=args.fps)
-        print(list_controls(camera.path))
+        backend = resolve_backend(args.backend)
+        camera = discover_camera(device=args.device, width=args.width, height=args.height, fps=args.fps, backend=backend)
+        print(list_controls(camera.path, backend=backend))
         return 0
     if args.preflight:
         return preflight(args)

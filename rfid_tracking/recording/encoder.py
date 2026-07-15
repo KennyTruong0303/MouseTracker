@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -13,6 +14,7 @@ from typing import Callable
 
 LOGGER = logging.getLogger(__name__)
 HEVC_ENCODER_ORDER = ("hevc_nvenc", "hevc_qsv", "hevc_vaapi", "hevc_amf", "libx265")
+WINDOWS_HEVC_ENCODER_ORDER = ("hevc_nvenc", "hevc_qsv", "hevc_amf", "libx265")
 
 
 @dataclass(frozen=True)
@@ -140,9 +142,13 @@ def probe_encoder(
 def select_hevc_encoder(
     requested: str = "auto",
     *,
+    backend: str = "auto",
     runner: Runner = subprocess.run,
 ) -> SelectedEncoder:
-    candidates = HEVC_ENCODER_ORDER if requested == "auto" else (requested,)
+    if requested == "auto":
+        candidates = WINDOWS_HEVC_ENCODER_ORDER if backend == "dshow" or os.name == "nt" else HEVC_ENCODER_ORDER
+    else:
+        candidates = (requested,)
     results: list[EncoderProbeResult] = []
     for encoder in candidates:
         result = probe_encoder(encoder, runner=runner)
@@ -191,4 +197,3 @@ def build_encode_command(
         "+faststart",
         str(output_path),
     ]
-

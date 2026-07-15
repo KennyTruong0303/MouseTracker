@@ -8,11 +8,18 @@ from pathlib import Path
 from unittest import mock
 
 from rfid_tracking.recording import encoder
+from rfid_tracking.recording.camera import (
+    CameraDevice,
+    choose_dshow_input_format,
+    parse_dshow_video_devices,
+    resolve_backend,
+)
 from rfid_tracking.recording.ffmpeg_recorder import (
     RecorderState,
     RecorderStats,
     SENTINEL,
     SegmentWriter,
+    capture_command,
     put_packet,
     synthetic_capture_thread,
     writer_thread,
@@ -214,6 +221,62 @@ class EncoderProbeTests(unittest.TestCase):
         self.assertEqual(selected.name, "hevc_qsv")
         self.assertEqual([result.encoder for result in selected.probe_results], ["hevc_nvenc", "hevc_qsv"])
         self.assertEqual(len(calls), 2)
+
+    def test_windows_encoder_order_skips_vaapi(self):
+        attempted: list[str] = []
+
+        def runner(command, check=False, text=True, capture_output=True, timeout=20.0):
+            for name in ("hevc_nvenc", "hevc_qsv", "hevc_amf", "libx265"):
+                if name in command:
+                    attempted.append(name)
+                    if name == "libx265":
+                        Path(command[-1]).write_bytes(b"ok")
+                        return mock.Mock(returncode=0, stdout="", stderr="")
+            return mock.Mock(returncode=1, stdout="", stderr="unavailable")
+
+        selected = encoder.select_hevc_encoder("auto", backend="dshow", runner=runner)
+        self.assertEqual(selected.name, "libx265")
+        self.assertEqual(attempted, ["hevc_nvenc", "hevc_qsv", "hevc_amf", "libx265"])
+
+
+class DirectShowBackendTests(unittest.TestCase):
+    def test_parse_dshow_video_devices(self):
+        listing = """
+[dshow @ 000001] DirectShow video devices (some may be both video and audio devices)
+[dshow @ 000001]  "USB Camera"
+[dshow @ 000001]     Alternative name "@device_pnp_\\\\?\\usb#vid"
+[dshow @ 000001]  "Integrated Webcam"
+[dshow @ 000001] DirectShow audio devices
+[dshow @ 000001]  "Microphone"
+"""
+        self.assertEqual(parse_dshow_video_devices(listing), ["USB Camera", "Integrated Webcam"])
+
+    def test_choose_dshow_input_format_prefers_mjpeg_exact_mode(self):
+        options = """
+[dshow @ 000001]   pixel_format=yuyv422  min s=1280x720 fps=30 max s=1280x720 fps=30
+[dshow @ 000001]   vcodec=mjpeg  min s=1280x720 fps=30 max s=1280x720 fps=30
+"""
+        self.assertEqual(choose_dshow_input_format(options, 1280, 720, 30.0), "mjpeg")
+        self.assertIsNone(choose_dshow_input_format(options, 1920, 1080, 30.0))
+
+    def test_resolve_backend_auto_uses_native_platform(self):
+        expected = "dshow" if __import__("os").name == "nt" else "v4l2"
+        self.assertEqual(resolve_backend("auto"), expected)
+
+    def test_dshow_capture_command_uses_directshow_camera_name(self):
+        camera = CameraDevice(
+            backend="dshow",
+            path="USB Camera",
+            name="USB Camera",
+            formats_text="",
+            preferred_input_format="mjpeg",
+        )
+        command = capture_command(camera, 1280, 720, 30.0)
+        self.assertIn("-f", command)
+        self.assertIn("dshow", command)
+        self.assertIn("video=USB Camera", command)
+        self.assertIn("-vcodec", command)
+        self.assertIn("mjpeg", command)
 
 
 if __name__ == "__main__":
