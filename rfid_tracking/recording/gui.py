@@ -34,6 +34,7 @@ try:  # Optional GUI dependency. The CLI must keep working without PySide6.
         QDialogButtonBox,
         QFileDialog,
         QFormLayout,
+        QGridLayout,
         QGroupBox,
         QHBoxLayout,
         QLabel,
@@ -44,10 +45,13 @@ try:  # Optional GUI dependency. The CLI must keep working without PySide6.
         QMessageBox,
         QPushButton,
         QPlainTextEdit,
+        QScrollArea,
+        QSizePolicy,
         QSpinBox,
         QDoubleSpinBox,
-        QTabWidget,
+        QSplitter,
         QTextEdit,
+        QToolButton,
         QVBoxLayout,
         QWidget,
     )
@@ -228,34 +232,72 @@ if PYSIDE6_AVAILABLE:
 
         def _build_ui(self) -> None:
             central = QWidget()
-            root = QVBoxLayout(central)
-            tabs = QTabWidget()
-            tabs.addTab(self._build_recording_tab(), "Recorder")
-            tabs.addTab(self._build_log_tab(), "Logs")
-            root.addWidget(tabs)
+            root = QHBoxLayout(central)
+            root.setContentsMargins(8, 8, 8, 8)
+            self.main_splitter = QSplitter(Qt.Horizontal)
+            self.main_splitter.addWidget(self._build_controls_panel())
+            self.detail_splitter = QSplitter(Qt.Vertical)
+            self.detail_splitter.addWidget(self._build_live_panel())
+            self.detail_splitter.addWidget(self._build_log_panel())
+            self.detail_splitter.setChildrenCollapsible(False)
+            self.main_splitter.addWidget(self.detail_splitter)
+            self.main_splitter.setChildrenCollapsible(False)
+            self.main_splitter.setStretchFactor(0, 0)
+            self.main_splitter.setStretchFactor(1, 1)
+            self.detail_splitter.setStretchFactor(0, 2)
+            self.detail_splitter.setStretchFactor(1, 1)
+            self.main_splitter.setSizes([420, 780])
+            self.detail_splitter.setSizes([560, 260])
+            root.addWidget(self.main_splitter)
             self.setCentralWidget(central)
 
-        def _build_recording_tab(self) -> QWidget:
+        def _build_controls_panel(self) -> QScrollArea:
+            scroll = QScrollArea()
+            self.controls_scroll = scroll
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            scroll.setMinimumWidth(430)
+            scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+            page = QWidget()
+            page.setMinimumWidth(420)
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(8, 8, 8, 8)
+            layout.setSpacing(10)
+            for group in (self._camera_group(), self._settings_group(), self._preflight_group(), self._controls_group()):
+                group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+                layout.addWidget(group)
+            layout.addStretch(1)
+            scroll.setWidget(page)
+            return scroll
+
+        def _build_live_panel(self) -> QWidget:
             page = QWidget()
             layout = QVBoxLayout(page)
-            layout.addWidget(self._camera_group())
-            layout.addWidget(self._settings_group())
-            layout.addWidget(self._preflight_group())
-            layout.addWidget(self._controls_group())
-            layout.addWidget(self._status_group())
-            layout.addWidget(self._preview_group())
-            layout.addStretch(1)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(8)
+            preview = self._preview_group()
+            status = self._status_group()
+            layout.addWidget(preview, 3)
+            layout.addWidget(status, 2)
             return page
 
         def _camera_group(self) -> QGroupBox:
             group = QGroupBox("Camera")
             form = QFormLayout(group)
+            self._configure_form_layout(form)
             self.backend_combo = QComboBox()
+            self._set_field_policy(self.backend_combo)
+            self.backend_combo.setMinimumWidth(180)
             self.backend_combo.addItems(["dshow", "auto", "v4l2"])
             self.camera_combo = QComboBox()
+            self._set_field_policy(self.camera_combo)
+            self.camera_combo.setMinimumWidth(180)
             self.refresh_button = QPushButton("Refresh Cameras")
+            self.refresh_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
             self.refresh_button.clicked.connect(self.refresh_cameras)
             self.camera_details = QLabel("No camera selected")
+            self.camera_details.setWordWrap(True)
             self.input_codec_label = QLabel("MJPEG")
             self.resolution_label = QLabel("1280x720")
             self.fps_label = QLabel("30 fps")
@@ -271,52 +313,82 @@ if PYSIDE6_AVAILABLE:
         def _settings_group(self) -> QGroupBox:
             group = QGroupBox("Recording Settings")
             form = QFormLayout(group)
+            self._configure_form_layout(form)
             self.output_dir_edit = QLineEdit(str(DEFAULT_OUTPUT_DIR))
-            browse = QPushButton("Browse")
-            browse.clicked.connect(self.browse_output_dir)
-            output_row = QHBoxLayout()
-            output_row.addWidget(self.output_dir_edit)
-            output_row.addWidget(browse)
+            self.output_dir_edit.setMinimumWidth(220)
+            self._set_field_policy(self.output_dir_edit)
+            self.output_browse_button = QPushButton("Browse")
+            self.output_browse_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            self.output_browse_button.clicked.connect(self.browse_output_dir)
+            output_row = self._browse_row(self.output_dir_edit, self.output_browse_button)
             self.segment_spin = QDoubleSpinBox()
+            self._set_field_policy(self.segment_spin)
             self.segment_spin.setRange(1, 3600)
             self.segment_spin.setValue(60)
             self.encoder_combo = QComboBox()
+            self._set_field_policy(self.encoder_combo)
+            self.encoder_combo.setMinimumWidth(180)
             self.encoder_combo.addItems(["auto", "hevc_nvenc", "hevc_qsv", "hevc_amf", "libx265"])
             self.ffmpeg_bin_edit = QLineEdit()
-            ffmpeg_browse = QPushButton("Browse")
-            ffmpeg_browse.clicked.connect(self.browse_ffmpeg_bin)
-            ffmpeg_row = QHBoxLayout()
-            ffmpeg_row.addWidget(self.ffmpeg_bin_edit)
-            ffmpeg_row.addWidget(ffmpeg_browse)
+            self._set_field_policy(self.ffmpeg_bin_edit)
+            self.ffmpeg_browse_button = QPushButton("Browse")
+            self.ffmpeg_browse_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            self.ffmpeg_browse_button.clicked.connect(self.browse_ffmpeg_bin)
+            ffmpeg_row = self._browse_row(self.ffmpeg_bin_edit, self.ffmpeg_browse_button)
             self.gap_spin = QDoubleSpinBox()
+            self._set_field_policy(self.gap_spin)
             self.gap_spin.setRange(1, 1000)
             self.gap_spin.setValue(50)
             self.width_spin = QSpinBox()
+            self._set_field_policy(self.width_spin)
             self.width_spin.setRange(1, 8192)
             self.width_spin.setValue(1280)
-            self.width_spin.setEnabled(False)
             self.height_spin = QSpinBox()
+            self._set_field_policy(self.height_spin)
             self.height_spin.setRange(1, 8192)
             self.height_spin.setValue(720)
-            self.height_spin.setEnabled(False)
             self.fps_spin = QDoubleSpinBox()
+            self._set_field_policy(self.fps_spin)
             self.fps_spin.setRange(1, 240)
             self.fps_spin.setValue(30)
-            self.fps_spin.setEnabled(False)
+            self.capture_mode_label = QLabel("MJPEG")
+            self.capture_size_label = QLabel("1280 x 720")
+            self.capture_fps_label = QLabel("30 fps")
             self.timezone_label = QLabel("Timezone: checking at preflight")
+            self.timezone_label.setWordWrap(True)
             self.onedrive_warning = QLabel("")
+            self.onedrive_warning.setWordWrap(True)
             self.onedrive_warning.setStyleSheet("color: #9a6700")
             form.addRow("Output directory", output_row)
             form.addRow("Segment seconds", self.segment_spin)
             form.addRow("Encoder", self.encoder_combo)
-            form.addRow("FFmpeg bin", ffmpeg_row)
             form.addRow("Gap threshold ms", self.gap_spin)
-            form.addRow("Width", self.width_spin)
-            form.addRow("Height", self.height_spin)
-            form.addRow("FPS", self.fps_spin)
+            form.addRow("Input codec", self.capture_mode_label)
+            form.addRow("Resolution", self.capture_size_label)
+            form.addRow("FPS", self.capture_fps_label)
             form.addRow("Timezone", self.timezone_label)
             form.addRow("", self.onedrive_warning)
+            self.advanced_button = QToolButton()
+            self.advanced_button.setText("Advanced Settings")
+            self.advanced_button.setCheckable(True)
+            self.advanced_button.setChecked(False)
+            self.advanced_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            self.advanced_button.setArrowType(Qt.RightArrow)
+            self.advanced_button.toggled.connect(self._set_advanced_visible)
+            self.advanced_container = QWidget()
+            advanced_form = QFormLayout(self.advanced_container)
+            self._configure_form_layout(advanced_form)
+            advanced_form.addRow("FFmpeg bin", ffmpeg_row)
+            advanced_form.addRow("Width", self.width_spin)
+            advanced_form.addRow("Height", self.height_spin)
+            advanced_form.addRow("FPS", self.fps_spin)
+            self.advanced_container.setVisible(False)
+            form.addRow("", self.advanced_button)
+            form.addRow("", self.advanced_container)
             self.output_dir_edit.textChanged.connect(self.update_onedrive_warning)
+            self.width_spin.valueChanged.connect(self._update_capture_summary)
+            self.height_spin.valueChanged.connect(self._update_capture_summary)
+            self.fps_spin.valueChanged.connect(self._update_capture_summary)
             return group
 
         def _preflight_group(self) -> QGroupBox:
@@ -325,32 +397,40 @@ if PYSIDE6_AVAILABLE:
             self.preflight_button = QPushButton("Run Preflight")
             self.preflight_button.clicked.connect(self.run_preflight)
             self.preflight_list = QListWidget()
+            self.preflight_list.setMinimumHeight(140)
+            self.preflight_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             layout.addWidget(self.preflight_button)
             layout.addWidget(self.preflight_list)
             return group
 
         def _controls_group(self) -> QGroupBox:
             group = QGroupBox("Recording Controls")
-            row = QHBoxLayout(group)
+            grid = QGridLayout(group)
             self.start_button = QPushButton("Start Recording")
             self.stop_button = QPushButton("Stop Recording")
             self.open_button = QPushButton("Open Output Folder")
             self.recover_button = QPushButton("Recover Partial Files")
+            for button in (self.start_button, self.stop_button, self.open_button, self.recover_button):
+                button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
             self.start_button.clicked.connect(self.start_recording)
             self.stop_button.clicked.connect(self.stop_recording)
             self.open_button.clicked.connect(self.open_output_folder)
             self.recover_button.clicked.connect(lambda: self.recoveryRequested.emit(self.config_from_ui()))
-            row.addWidget(self.start_button)
-            row.addWidget(self.stop_button)
-            row.addWidget(self.open_button)
-            row.addWidget(self.recover_button)
+            grid.addWidget(self.start_button, 0, 0)
+            grid.addWidget(self.stop_button, 0, 1)
+            grid.addWidget(self.open_button, 1, 0)
+            grid.addWidget(self.recover_button, 1, 1)
+            grid.setColumnStretch(0, 1)
+            grid.setColumnStretch(1, 1)
             return group
 
         def _status_group(self) -> QGroupBox:
             group = QGroupBox("Live Status")
+            group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             form = QFormLayout(group)
+            self._configure_form_layout(form)
             self.status_labels: dict[str, QLabel] = {}
             for label in (
                 "State",
@@ -370,31 +450,66 @@ if PYSIDE6_AVAILABLE:
                 "Last validation",
             ):
                 widget = QLabel("-")
+                widget.setWordWrap(True)
+                widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
                 self.status_labels[label] = widget
                 form.addRow(label, widget)
             return group
 
         def _preview_group(self) -> QGroupBox:
             group = QGroupBox("Live Preview")
+            group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             layout = QVBoxLayout(group)
             self.preview_checkbox = QCheckBox("Show live preview")
             self.preview_label = QLabel("Preview disabled")
             self.preview_label.setMinimumSize(320, 180)
+            self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             self.preview_label.setAlignment(Qt.AlignCenter)
             layout.addWidget(self.preview_checkbox)
-            layout.addWidget(self.preview_label)
+            layout.addWidget(self.preview_label, 1)
             return group
 
-        def _build_log_tab(self) -> QWidget:
+        def _build_log_panel(self) -> QWidget:
             page = QWidget()
             layout = QVBoxLayout(page)
+            layout.setContentsMargins(0, 0, 0, 0)
             self.log_filter = QComboBox()
+            self.log_filter.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
             self.log_filter.addItems(list(LOG_LEVELS))
             self.log_view = QPlainTextEdit()
             self.log_view.setReadOnly(True)
+            self.log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             layout.addWidget(self.log_filter)
-            layout.addWidget(self.log_view)
+            layout.addWidget(self.log_view, 1)
             return page
+
+        def _configure_form_layout(self, form: QFormLayout) -> None:
+            form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+            form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+            form.setLabelAlignment(Qt.AlignLeft)
+            form.setFormAlignment(Qt.AlignTop)
+            form.setHorizontalSpacing(12)
+            form.setVerticalSpacing(8)
+
+        def _set_field_policy(self, widget: QWidget) -> None:
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        def _browse_row(self, field: QLineEdit, button: QPushButton) -> QWidget:
+            row = QWidget()
+            layout = QHBoxLayout(row)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(6)
+            layout.addWidget(field, 1)
+            layout.addWidget(button, 0)
+            return row
+
+        def _set_advanced_visible(self, visible: bool) -> None:
+            self.advanced_button.setArrowType(Qt.DownArrow if visible else Qt.RightArrow)
+            self.advanced_container.setVisible(visible)
+
+        def _update_capture_summary(self) -> None:
+            self.capture_size_label.setText(f"{self.width_spin.value()} x {self.height_spin.value()}")
+            self.capture_fps_label.setText(f"{self.fps_spin.value():g} fps")
 
         def config_from_ui(self) -> RecorderConfig:
             return RecorderConfig(
@@ -558,11 +673,19 @@ if PYSIDE6_AVAILABLE:
             if "window_geometry" in self.settings:
                 geo = self.settings["window_geometry"]
                 self.resize(geo.get("width", 1000), geo.get("height", 900))
+                if "x" in geo and "y" in geo:
+                    self.move(geo["x"], geo["y"])
             else:
                 self.resize(1000, 900)
+            if "main_splitter_sizes" in self.settings:
+                self.main_splitter.setSizes(self.settings["main_splitter_sizes"])
+            if "detail_splitter_sizes" in self.settings:
+                self.detail_splitter.setSizes(self.settings["detail_splitter_sizes"])
             self.update_onedrive_warning()
+            self._update_capture_summary()
 
         def _save_settings(self) -> None:
+            position = self.pos()
             save_settings(
                 {
                     "camera_name": self.camera_combo.currentText(),
@@ -572,7 +695,14 @@ if PYSIDE6_AVAILABLE:
                     "segment_seconds": self.segment_spin.value(),
                     "gap_threshold_ms": self.gap_spin.value(),
                     "preview_enabled": self.preview_checkbox.isChecked(),
-                    "window_geometry": {"width": self.width(), "height": self.height()},
+                    "window_geometry": {
+                        "x": position.x(),
+                        "y": position.y(),
+                        "width": self.width(),
+                        "height": self.height(),
+                    },
+                    "main_splitter_sizes": self.main_splitter.sizes(),
+                    "detail_splitter_sizes": self.detail_splitter.sizes(),
                 }
             )
 

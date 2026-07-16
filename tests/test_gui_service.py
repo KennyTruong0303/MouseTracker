@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from unittest import mock
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from rfid_tracking.recording import gui
 from rfid_tracking.recording.camera import CameraDevice
@@ -215,6 +218,95 @@ class RecorderServiceTests(unittest.TestCase):
         failed = PreflightResult([PreflightCheck("camera", "fail", "missing")])
         self.assertTrue(gui.can_start_recording(passed.ok, False))
         self.assertFalse(gui.can_start_recording(failed.ok, False))
+
+
+@unittest.skipUnless(gui.PYSIDE6_AVAILABLE, "PySide6 is not installed")
+class GuiLayoutTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.settings_path = Path(self.tmp.name) / "recorder_gui.json"
+        self.settings_patcher = mock.patch("rfid_tracking.recording.gui.settings_path", return_value=self.settings_path)
+        self.camera_patcher = mock.patch(
+            "rfid_tracking.recording.gui.RecorderService.list_cameras",
+            return_value=["DECXIN CAMERA"],
+        )
+        self.settings_patcher.start()
+        self.camera_patcher.start()
+        self.window = gui.MainWindow()
+        self.window.output_dir_edit.setText(r"D:\MouseTracker\data\mota_gui_test_20260715")
+        self.window.show()
+        self.app.processEvents()
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+        self.camera_patcher.stop()
+        self.settings_patcher.stop()
+        self.tmp.cleanup()
+
+    def _resize_and_process(self, width: int, height: int) -> None:
+        self.window.resize(width, height)
+        self.app.processEvents()
+
+    def test_recording_settings_widgets_retain_usable_widths(self):
+        self._resize_and_process(1000, 800)
+        self.assertGreaterEqual(self.window.output_dir_edit.width(), 220)
+        self.assertGreaterEqual(self.window.encoder_combo.width(), 180)
+        self.assertGreaterEqual(self.window.segment_spin.width(), 120)
+
+    def test_output_path_field_expands_and_browse_stays_visible(self):
+        self._resize_and_process(1100, 800)
+        self.assertTrue(self.window.output_browse_button.isVisible())
+        self.assertGreater(self.window.output_dir_edit.width(), self.window.output_browse_button.width())
+
+    def test_maximizing_does_not_reduce_field_widths(self):
+        self._resize_and_process(1000, 800)
+        normal_width = self.window.output_dir_edit.width()
+        self._resize_and_process(1600, 1000)
+        self.assertGreaterEqual(self.window.output_dir_edit.width(), normal_width)
+
+    def test_small_window_mode_provides_scrolling_and_keeps_controls_accessible(self):
+        self._resize_and_process(760, 480)
+        scrollbar = self.window.controls_scroll.verticalScrollBar()
+        self.assertGreater(scrollbar.maximum(), 0)
+        self.assertFalse(self.window.start_button.isHidden())
+        self.assertFalse(self.window.stop_button.isHidden())
+
+    def test_splitter_positions_can_be_saved_and_restored(self):
+        self.window.main_splitter.setSizes([520, 900])
+        self.window.detail_splitter.setSizes([640, 260])
+        self.app.processEvents()
+        self.window._save_settings()
+        data = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        self.assertIn("main_splitter_sizes", data)
+        self.assertIn("detail_splitter_sizes", data)
+
+        self.window.close()
+        self.app.processEvents()
+        self.window = gui.MainWindow()
+        self.window.show()
+        self.app.processEvents()
+        self.assertEqual(len(self.window.main_splitter.sizes()), 2)
+        self.assertEqual(len(self.window.detail_splitter.sizes()), 2)
+
+    def test_advanced_settings_collapse_without_reserved_space(self):
+        self._resize_and_process(1000, 800)
+        collapsed_height = self.window.advanced_container.parentWidget().sizeHint().height()
+        self.assertFalse(self.window.advanced_container.isVisible())
+        self.window.advanced_button.setChecked(True)
+        self.app.processEvents()
+        expanded_height = self.window.advanced_container.parentWidget().sizeHint().height()
+        self.assertTrue(self.window.advanced_container.isVisible())
+        self.assertGreater(expanded_height, collapsed_height)
+        self.window.advanced_button.setChecked(False)
+        self.app.processEvents()
+        self.assertFalse(self.window.advanced_container.isVisible())
 
 
 if __name__ == "__main__":
