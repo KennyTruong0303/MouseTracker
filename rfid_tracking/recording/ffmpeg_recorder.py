@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .camera import (
     CameraDevice,
@@ -63,12 +63,22 @@ class SegmentState(Enum):
 @dataclass
 class RecorderStats:
     queue_high_water_mark: int = 0
+    current_queue_size: int = 0
     incomplete_frames: int = 0
     queue_full_events: int = 0
     unwritten_frames: int = 0
     frame_gaps: int = 0
     suspicious_short_intervals: int = 0
     segments: list[Path] = field(default_factory=list)
+    total_frames: int = 0
+    reconnect_count: int = 0
+    selected_camera: str | None = None
+    selected_encoder: str | None = None
+    recording_start_wall_time_iso8601: str | None = None
+    recording_start_monotonic_ns: int | None = None
+    current_segment_filename: str | None = None
+    current_segment_start_monotonic_ns: int | None = None
+    last_validation_result: str | None = None
 
 
 @dataclass
@@ -292,6 +302,7 @@ class SegmentWriter:
     def write_packet(self, packet: FramePacket, stats: RecorderStats) -> None:
         if self.recording_start_monotonic_ns is None:
             self.recording_start_monotonic_ns = packet.monotonic_ns
+            stats.recording_start_monotonic_ns = packet.monotonic_ns
         if self.paths is None:
             self.open_for_packet(packet)
 
@@ -306,6 +317,8 @@ class SegmentWriter:
         assert self.csv is not None
         assert self.recording_start_monotonic_ns is not None
         assert self.segment_start_monotonic_ns is not None
+        stats.current_segment_filename = self.paths.segment_filename
+        stats.current_segment_start_monotonic_ns = self.segment_start_monotonic_ns
 
         try:
             self.process.stdin.write(packet.data)
@@ -382,7 +395,10 @@ class SegmentWriter:
                             recovery.final_video.name,
                         )
                         stats.segments.append(recovery.final_video)
+                        stats.last_validation_result = f"Recovered {recovery.final_video.name}"
                         self._mark_finalized_and_reset()
+                        stats.current_segment_filename = None
+                        stats.current_segment_start_monotonic_ns = None
                         return
                     LOGGER.error(
                         "Partial segment was not recoverable: %s",
@@ -401,15 +417,22 @@ class SegmentWriter:
                 )
                 if not result.ok:
                     self.state = SegmentState.FAILED
+                    stats.last_validation_result = "; ".join(result.errors)
                     raise RuntimeError(
                         f"Segment validation failed for {paths.part_video}: {'; '.join(result.errors)}"
                     )
+                stats.last_validation_result = (
+                    f"Validated {paths.segment_filename}: "
+                    f"{result.video_frames} video frames, {result.csv_rows} CSV rows"
+                )
 
             os.replace(paths.part_video, paths.final_video)
             os.replace(paths.part_csv, paths.final_csv)
             stats.segments.append(paths.final_video)
             LOGGER.info("Finalized segment %s", paths.final_video.name)
             self._mark_finalized_and_reset()
+            stats.current_segment_filename = None
+            stats.current_segment_start_monotonic_ns = None
         except Exception:
             if self.state != SegmentState.FINALIZED:
                 self.state = SegmentState.FAILED
@@ -505,7 +528,10 @@ def put_packet(
 ) -> bool:
     try:
         packets.put(packet, timeout=1.0)
-        state.stats.queue_high_water_mark = max(state.stats.queue_high_water_mark, packets.qsize())
+        queue_size = packets.qsize()
+        state.stats.current_queue_size = queue_size
+        state.stats.queue_high_water_mark = max(state.stats.queue_high_water_mark, queue_size)
+        state.stats.total_frames = max(state.stats.total_frames, packet.global_frame_index + 1)
         return True
     except queue.Full:
         state.stats.queue_full_events += 1
@@ -525,10 +551,14 @@ def capture_thread(
     width: int,
     height: int,
     fps: float,
+    preview_callback: Callable[[FramePacket], None] | None = None,
+    preview_interval_s: float = 0.125,
 ) -> None:
     frame_bytes = width * height * 3
     index = 0
     retry_delay = 1.0
+    next_preview_ns = 0
+    preview_interval_ns = int(preview_interval_s * 1_000_000_000)
     try:
         while not state.shutdown_requested.is_set():
             command = capture_command(camera, width, height, fps)
@@ -564,6 +594,12 @@ def capture_thread(
                     packet = FramePacket(data, index, wall_ns, monotonic_ns)
                     if not put_packet(packets, packet, state):
                         break
+                    if preview_callback and monotonic_ns >= next_preview_ns:
+                        try:
+                            preview_callback(packet)
+                        except Exception as exc:  # noqa: BLE001
+                            LOGGER.warning("Preview callback failed; dropping preview frame: %s", exc)
+                        next_preview_ns = monotonic_ns + preview_interval_ns
                     index += 1
             finally:
                 process.terminate()
@@ -591,6 +627,7 @@ def capture_thread(
                     backend=requested_backend,
                 )
                 retry_delay = 1.0
+                state.stats.reconnect_count += 1
                 LOGGER.info("Reconnected camera: %s %s", camera.backend, camera.name)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.error("Camera rediscovery failed: %s", exc)
@@ -610,12 +647,16 @@ def synthetic_capture_thread(
     height: int,
     fps: float,
     duration_seconds: float,
+    preview_callback: Callable[[FramePacket], None] | None = None,
+    preview_interval_s: float = 0.125,
 ) -> None:
     total_frames = int(duration_seconds * fps)
     frame_interval_ns = int(1_000_000_000 / fps)
     start_wall_ns = time.time_ns()
     start_monotonic_ns = time.monotonic_ns()
     frame = bytes(width * height * 3)
+    next_preview_ns = start_monotonic_ns
+    preview_interval_ns = int(preview_interval_s * 1_000_000_000)
     try:
         for index in range(total_frames):
             if state.shutdown_requested.is_set():
@@ -628,6 +669,12 @@ def synthetic_capture_thread(
             )
             if not put_packet(packets, packet, state):
                 break
+            if preview_callback and packet.monotonic_ns >= next_preview_ns:
+                try:
+                    preview_callback(packet)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Preview callback failed; dropping preview frame: %s", exc)
+                next_preview_ns = packet.monotonic_ns + preview_interval_ns
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Synthetic capture failed")
         state.fail(f"Synthetic capture failed: {exc}")
@@ -645,6 +692,7 @@ def writer_thread(
     try:
         while True:
             item = packets.get()
+            state.stats.current_queue_size = packets.qsize()
             if item is SENTINEL:
                 break
             if item is SEGMENT_BREAK:
@@ -654,6 +702,7 @@ def writer_thread(
             writer.write_packet(item, state.stats)
         while not packets.empty():
             item = packets.get_nowait()
+            state.stats.current_queue_size = packets.qsize()
             if item is SEGMENT_BREAK:
                 writer.finalize_current(state.stats)
             elif item is not SENTINEL:
@@ -732,7 +781,12 @@ def recover_partials(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
-def run_recording(args: argparse.Namespace) -> int:
+def run_recording(
+    args: argparse.Namespace,
+    *,
+    state: RecorderState | None = None,
+    preview_callback: Callable[[FramePacket], None] | None = None,
+) -> int:
     output_dir = args.output_dir
     backend = resolve_backend(args.backend)
     log_path = configure_logging(output_dir)
@@ -748,6 +802,15 @@ def run_recording(args: argparse.Namespace) -> int:
             result.returncode,
             result.stderr.strip(),
         )
+
+    if state is None:
+        state = RecorderState(
+            stop_event=threading.Event(),
+            failure_event=threading.Event(),
+            stats=RecorderStats(),
+        )
+    state.stats.selected_encoder = selected_encoder.name
+    state.stats.recording_start_wall_time_iso8601 = datetime.now().astimezone().isoformat()
 
     camera = None
     controls_text = ""
@@ -769,12 +832,10 @@ def run_recording(args: argparse.Namespace) -> int:
             apply_controls(camera.path, load_control_config(args.camera_controls_config), backend=backend)
         elif args.camera_controls_config:
             raise RuntimeError("--camera-controls-config is only supported with --backend v4l2")
+        state.stats.selected_camera = camera.name
+    else:
+        state.stats.selected_camera = "synthetic"
 
-    state = RecorderState(
-        stop_event=threading.Event(),
-        failure_event=threading.Event(),
-        stats=RecorderStats(),
-    )
     stop_file = args.stop_file or default_stop_file(output_dir)
     packets: "queue.Queue[FramePacket | object]" = queue.Queue(maxsize=args.queue_size)
     segment_writer = SegmentWriter(
@@ -822,6 +883,7 @@ def run_recording(args: argparse.Namespace) -> int:
                     "height": args.height,
                     "fps": args.fps,
                     "duration_seconds": args.duration_seconds,
+                    "preview_callback": preview_callback,
                 },
             )
         else:
@@ -837,6 +899,7 @@ def run_recording(args: argparse.Namespace) -> int:
                     "width": args.width,
                     "height": args.height,
                     "fps": args.fps,
+                    "preview_callback": preview_callback,
                 },
             )
         writer.start()
