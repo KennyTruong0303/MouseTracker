@@ -20,9 +20,15 @@ from typing import Callable, Iterable
 
 from .camera import (
     CameraDevice,
+    DECXIN_CAMERA_NAME,
+    DECXIN_DEFAULT_FPS,
+    DECXIN_DEFAULT_HEIGHT,
+    DECXIN_DEFAULT_INPUT_FORMAT,
+    DECXIN_DEFAULT_WIDTH,
     DSHOW_CAMERA_DIAGNOSTIC,
     WSL_CAMERA_DIAGNOSTIC,
     apply_controls,
+    decxin_mode_report,
     discover_camera,
     list_camera_devices,
     list_controls,
@@ -49,6 +55,7 @@ from .validation import recover_partial_segment, recover_partials_in_dir, valida
 
 LOGGER = logging.getLogger("rfid_tracking.recording")
 DEFAULT_OUTPUT_DIR = Path(r"D:\MouseTracker\data\mota") if os.name == "nt" else Path("/mnt/d/MouseTracker/data/mota")
+DEFAULT_QUEUE_SIZE = 900
 SENTINEL = object()
 SEGMENT_BREAK = object()
 
@@ -58,6 +65,12 @@ class SegmentState(Enum):
     FINALIZING = "FINALIZING"
     FINALIZED = "FINALIZED"
     FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class ClockAnchor:
+    wall_time_unix_ns: int
+    monotonic_ns: int
 
 
 @dataclass
@@ -146,7 +159,38 @@ def check_output_dir(path: Path) -> tuple[bool, str]:
         probe.unlink()
         return True, "writable"
     except OSError as exc:
-        return False, str(exc)
+            return False, str(exc)
+
+
+def high_resolution_monotonic_ns() -> int:
+    return time.perf_counter_ns()
+
+
+def create_clock_anchor() -> ClockAnchor:
+    return ClockAnchor(
+        wall_time_unix_ns=time.time_ns(),
+        monotonic_ns=high_resolution_monotonic_ns(),
+    )
+
+
+def wall_time_from_anchor(anchor: ClockAnchor, monotonic_ns: int) -> int:
+    return anchor.wall_time_unix_ns + (monotonic_ns - anchor.monotonic_ns)
+
+
+def frame_interval_ns(fps: float) -> int:
+    return int(round(1_000_000_000 / fps))
+
+
+def bytes_per_pixel(pixel_format: str) -> int:
+    if pixel_format == "gray":
+        return 1
+    if pixel_format == "bgr24":
+        return 3
+    raise ValueError(f"Unsupported raw pixel format {pixel_format!r}")
+
+
+def frame_byte_count(width: int, height: int, pixel_format: str) -> int:
+    return width * height * bytes_per_pixel(pixel_format)
 
 
 def print_table(rows: Iterable[tuple[str, bool, str]]) -> None:
@@ -173,6 +217,13 @@ def log_clock_diagnostics(expected_offset: str | None) -> None:
     LOGGER.info("Windows/local time at recording start: %s", now.isoformat())
     LOGGER.info("Local timezone names: %s", time.tzname)
     LOGGER.info("Local UTC offset: %s", current_offset)
+    LOGGER.info("Python time clock: %s", time.get_clock_info("time"))
+    LOGGER.info("Python monotonic clock: %s", time.get_clock_info("monotonic"))
+    LOGGER.info("Python perf_counter clock: %s", time.get_clock_info("perf_counter"))
+    if time.get_clock_info("monotonic").resolution > 0.005:
+        LOGGER.warning(
+            "Python monotonic clock is coarse; using perf_counter_ns for per-frame monotonic timestamps"
+        )
     if expected_offset and current_offset != expected_offset:
         LOGGER.warning(
             "Local timezone offset %s does not match expected experimental clock offset %s",
@@ -202,6 +253,18 @@ def print_stop_instructions(output_dir: Path) -> None:
         "python -m rfid_tracking.recording.ffmpeg_recorder --request-stop "
         f'--output-dir "{output_dir}"'
     )
+
+
+def resolve_timestamp_source(requested: str, *, camera: CameraDevice | None, synthetic: bool) -> str:
+    if requested not in {"auto", "arrival", "cadence"}:
+        raise ValueError("--timestamp-source must be one of: auto, arrival, cadence")
+    if requested != "auto":
+        return requested
+    if synthetic:
+        return "cadence"
+    if camera and camera.backend == "dshow":
+        return "cadence"
+    return "arrival"
 
 
 def keyboard_stop_thread(state: RecorderState, input_stream=None) -> None:
@@ -252,6 +315,7 @@ class SegmentWriter:
         encoder: str,
         gap_threshold_ms: float,
         validate: bool,
+        input_pixel_format: str = "bgr24",
     ) -> None:
         self.output_dir = output_dir
         self.width = width
@@ -261,6 +325,7 @@ class SegmentWriter:
         self.encoder = encoder
         self.gap_threshold_ms = gap_threshold_ms
         self.validate = validate
+        self.input_pixel_format = input_pixel_format
         self.paths: SegmentPaths | None = None
         self.process: subprocess.Popen[bytes] | None = None
         self.csv: TimestampCsvWriter | None = None
@@ -287,6 +352,7 @@ class SegmentWriter:
             width=self.width,
             height=self.height,
             fps=self.fps,
+            input_pixel_format=self.input_pixel_format,
         )
         LOGGER.info("Opening segment %s", self.paths.segment_filename)
         LOGGER.info("Encoder command: %s", " ".join(command))
@@ -493,7 +559,7 @@ def capture_command(camera: CameraDevice, width: int, height: int, fps: float) -
             f"video={camera.name}",
             "-an",
             "-pix_fmt",
-            "bgr24",
+            camera.raw_pixel_format,
             "-f",
             "rawvideo",
             "pipe:1",
@@ -516,7 +582,7 @@ def capture_command(camera: CameraDevice, width: int, height: int, fps: float) -
         "-f",
         "rawvideo",
         "-pix_fmt",
-        "bgr24",
+        camera.raw_pixel_format,
         "-",
     ]
 
@@ -551,14 +617,19 @@ def capture_thread(
     width: int,
     height: int,
     fps: float,
+    timestamp_source: str = "arrival",
     preview_callback: Callable[[FramePacket], None] | None = None,
     preview_interval_s: float = 0.125,
 ) -> None:
-    frame_bytes = width * height * 3
+    frame_bytes = frame_byte_count(width, height, camera.raw_pixel_format)
     index = 0
     retry_delay = 1.0
     next_preview_ns = 0
     preview_interval_ns = int(preview_interval_s * 1_000_000_000)
+    clock_anchor = create_clock_anchor()
+    cadence_start_monotonic_ns: int | None = None
+    cadence_start_wall_time_unix_ns: int | None = None
+    cadence_interval_ns = frame_interval_ns(fps)
     try:
         while not state.shutdown_requested.is_set():
             command = capture_command(camera, width, height, fps)
@@ -589,9 +660,28 @@ def capture_thread(
                             LOGGER.error("Incomplete frame buffer: %s of %s bytes", len(data), frame_bytes)
                         packets.put(SEGMENT_BREAK)
                         break
-                    wall_ns = time.time_ns()
-                    monotonic_ns = time.monotonic_ns()
-                    packet = FramePacket(data, index, wall_ns, monotonic_ns)
+                    arrival_monotonic_ns = high_resolution_monotonic_ns()
+                    arrival_wall_ns = wall_time_from_anchor(clock_anchor, arrival_monotonic_ns)
+                    if timestamp_source == "cadence":
+                        if cadence_start_monotonic_ns is None:
+                            cadence_start_monotonic_ns = arrival_monotonic_ns
+                            cadence_start_wall_time_unix_ns = arrival_wall_ns
+                        monotonic_ns = cadence_start_monotonic_ns + index * cadence_interval_ns
+                        assert cadence_start_wall_time_unix_ns is not None
+                        wall_ns = cadence_start_wall_time_unix_ns + index * cadence_interval_ns
+                    else:
+                        monotonic_ns = arrival_monotonic_ns
+                        wall_ns = arrival_wall_ns
+                    packet = FramePacket(
+                        data,
+                        index,
+                        wall_ns,
+                        monotonic_ns,
+                        camera.raw_pixel_format,
+                        capture_arrival_wall_time_unix_ns=arrival_wall_ns,
+                        capture_arrival_monotonic_ns=arrival_monotonic_ns,
+                        timestamp_source=timestamp_source,
+                    )
                     if not put_packet(packets, packet, state):
                         break
                     if preview_callback and monotonic_ns >= next_preview_ns:
@@ -647,14 +737,16 @@ def synthetic_capture_thread(
     height: int,
     fps: float,
     duration_seconds: float,
+    timestamp_source: str = "cadence",
     preview_callback: Callable[[FramePacket], None] | None = None,
     preview_interval_s: float = 0.125,
 ) -> None:
     total_frames = int(duration_seconds * fps)
-    frame_interval_ns = int(1_000_000_000 / fps)
-    start_wall_ns = time.time_ns()
-    start_monotonic_ns = time.monotonic_ns()
-    frame = bytes(width * height * 3)
+    frame_interval = frame_interval_ns(fps)
+    clock_anchor = create_clock_anchor()
+    start_monotonic_ns = clock_anchor.monotonic_ns
+    start_wall_ns = clock_anchor.wall_time_unix_ns
+    frame = bytes(frame_byte_count(width, height, "bgr24"))
     next_preview_ns = start_monotonic_ns
     preview_interval_ns = int(preview_interval_s * 1_000_000_000)
     try:
@@ -664,8 +756,9 @@ def synthetic_capture_thread(
             packet = FramePacket(
                 data=frame,
                 global_frame_index=index,
-                wall_time_unix_ns=start_wall_ns + index * frame_interval_ns,
-                monotonic_ns=start_monotonic_ns + index * frame_interval_ns,
+                wall_time_unix_ns=start_wall_ns + index * frame_interval,
+                monotonic_ns=start_monotonic_ns + index * frame_interval,
+                timestamp_source=timestamp_source,
             )
             if not put_packet(packets, packet, state):
                 break
@@ -717,6 +810,7 @@ def writer_thread(
 def preflight(args: argparse.Namespace) -> int:
     rows: list[tuple[str, bool, str]] = []
     backend = resolve_backend(args.backend)
+    camera: CameraDevice | None = None
     for tool, ok, detail in ensure_tools(backend=backend, include_camera_tools=not args.synthetic):
         rows.append((tool, ok, detail))
     out_ok, out_detail = check_output_dir(args.output_dir)
@@ -745,6 +839,25 @@ def preflight(args: argparse.Namespace) -> int:
                     f"{args.width}x{args.height}@{args.fps:g}",
                 )
             )
+            if backend == "dshow":
+                rows.append(
+                    (
+                        "DECXIN profile",
+                        camera.profile == "DECXIN",
+                        (
+                            f"{camera.name}; USB VID:PID "
+                            f"{camera.usb_vid or 'unknown'}:{camera.usb_pid or 'unknown'}; "
+                            f"REV {camera.usb_revision or 'unknown'}; MI {camera.usb_interface or 'unknown'}; "
+                            f"{camera.sensor_color}; {camera.shutter_type} shutter; "
+                            f"target {DECXIN_DEFAULT_INPUT_FORMAT} "
+                            f"{DECXIN_DEFAULT_WIDTH}x{DECXIN_DEFAULT_HEIGHT}@{DECXIN_DEFAULT_FPS:g}; "
+                            f"raw {camera.raw_pixel_format}; "
+                            f"instance {camera.device_instance_path or 'unknown'}"
+                        )
+                        if camera.profile == "DECXIN"
+                        else f"selected {camera.name}; expected {DECXIN_CAMERA_NAME}",
+                    )
+                )
         except Exception as exc:  # noqa: BLE001
             detail = str(exc)
             if "No V4L2 camera" in detail:
@@ -752,8 +865,11 @@ def preflight(args: argparse.Namespace) -> int:
             if "No DirectShow" in detail:
                 detail = DSHOW_CAMERA_DIAGNOSTIC
             rows.append(("camera", False, detail.replace("\n", " ")))
-    frame_bytes = args.width * args.height * 3
-    rows.append(("raw frame size", frame_bytes == args.width * args.height * 3, f"{frame_bytes} bytes"))
+    raw_pixel_format = "bgr24"
+    if not args.synthetic and camera is not None:
+        raw_pixel_format = camera.raw_pixel_format
+    frame_bytes = frame_byte_count(args.width, args.height, raw_pixel_format)
+    rows.append(("raw frame size", True, f"{frame_bytes} bytes ({raw_pixel_format})"))
     print_table(rows)
     return 0 if all(ok for _name, ok, _detail in rows) else 1
 
@@ -824,7 +940,40 @@ def run_recording(
         )
         controls_text = list_controls(camera.path, backend=backend)
         LOGGER.info("Selected camera: %s %s", camera.backend, camera.name)
+        if camera.profile == "DECXIN":
+            LOGGER.info(
+                (
+                    "DECXIN camera profile selected: name=%s usb_vid=%s usb_pid=%s "
+                    "usb_revision=%s usb_interface=%s sensor_color=%s shutter=%s "
+                    "raw_pixel_format=%s device_instance_path=%s parent_device=%s "
+                    "hardware_ids=%s sensor_model_hint=%s alternative_name=%s"
+                ),
+                camera.name,
+                camera.usb_vid or "unknown",
+                camera.usb_pid or "unknown",
+                camera.usb_revision or "unknown",
+                camera.usb_interface or "unknown",
+                camera.sensor_color or "unknown",
+                camera.shutter_type or "unknown",
+                camera.raw_pixel_format,
+                camera.device_instance_path or "unknown",
+                camera.parent_device or "unknown",
+                ", ".join(camera.hardware_ids) or "unknown",
+                camera.sensor_model_hint or "unknown",
+                camera.alternative_name or "unknown",
+            )
+            LOGGER.info(
+                "DECXIN target mode: %s %sx%s@%s fps",
+                DECXIN_DEFAULT_INPUT_FORMAT,
+                DECXIN_DEFAULT_WIDTH,
+                DECXIN_DEFAULT_HEIGHT,
+                f"{DECXIN_DEFAULT_FPS:g}",
+            )
+            mode_report = decxin_mode_report(camera.formats_text)
+            if mode_report:
+                LOGGER.info("DECXIN DirectShow modes:\n%s", mode_report)
         LOGGER.info("Camera input format: %s", camera.preferred_input_format)
+        LOGGER.info("Decoded raw frame pixel format: %s", camera.raw_pixel_format)
         LOGGER.info("Camera options/controls:\n%s", controls_text)
         if backend == "v4l2":
             for warning in warn_about_auto_controls(controls_text):
@@ -835,6 +984,9 @@ def run_recording(
         state.stats.selected_camera = camera.name
     else:
         state.stats.selected_camera = "synthetic"
+
+    timestamp_source = resolve_timestamp_source(args.timestamp_source, camera=camera, synthetic=args.synthetic)
+    LOGGER.info("Timestamp source: %s", timestamp_source)
 
     stop_file = args.stop_file or default_stop_file(output_dir)
     packets: "queue.Queue[FramePacket | object]" = queue.Queue(maxsize=args.queue_size)
@@ -847,6 +999,7 @@ def run_recording(
         encoder=selected_encoder.name,
         gap_threshold_ms=args.gap_threshold_ms,
         validate=not args.skip_validation,
+        input_pixel_format=camera.raw_pixel_format if camera else "bgr24",
     )
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -883,6 +1036,7 @@ def run_recording(
                     "height": args.height,
                     "fps": args.fps,
                     "duration_seconds": args.duration_seconds,
+                    "timestamp_source": timestamp_source,
                     "preview_callback": preview_callback,
                 },
             )
@@ -899,6 +1053,7 @@ def run_recording(
                     "width": args.width,
                     "height": args.height,
                     "fps": args.fps,
+                    "timestamp_source": timestamp_source,
                     "preview_callback": preview_callback,
                 },
             )
@@ -935,7 +1090,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--segment-seconds", type=float, default=60.0)
     parser.add_argument("--encoder", default="auto")
     parser.add_argument("--gap-threshold-ms", type=float, default=50.0)
-    parser.add_argument("--queue-size", type=int, default=300)
+    parser.add_argument("--queue-size", type=int, default=DEFAULT_QUEUE_SIZE)
     parser.add_argument("--duration-seconds", type=float, default=0.0)
     parser.add_argument("--synthetic", action="store_true")
     parser.add_argument("--preflight", action="store_true")
@@ -950,6 +1105,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-file", type=Path)
     parser.add_argument("--camera-controls-config")
     parser.add_argument("--expected-timezone-offset", default="+08:00")
+    parser.add_argument("--timestamp-source", choices=("auto", "arrival", "cadence"), default="auto")
     parser.add_argument("--skip-validation", action="store_true")
     return parser
 

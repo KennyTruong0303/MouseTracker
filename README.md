@@ -34,6 +34,43 @@ ffmpeg -hide_banner -list_options true -f dshow -i video="CAMERA NAME"
 
 The recorder will not silently change resolution or frame rate. The selected camera must expose exactly 1280x720 at 30 fps.
 
+## DECXIN Camera Profile
+
+On Kenny's Windows recording machine, the intended camera is:
+
+```text
+DECXIN CAMERA
+USB VID:PID 1bcf:2cd1
+Hardware IDs:
+  USB\VID_1BCF&PID_2CD1&REV_9281&MI_00
+  USB\VID_1BCF&PID_2CD1&MI_00
+Device Instance Path:
+  USB\VID_1BCF&PID_2CD1&MI_00\6&1BD18552&0&0000
+Parent:
+  USB\VID_1BCF&PID_2CD1\01.00.00
+monochrome global-shutter camera
+```
+
+The observed Windows `Physical device object name` was `\Device\000001d2`.
+That field is logged only as a diagnostic because Windows may assign a
+different object name after reconnects or reboot.
+
+DirectShow exposes its usable 1280x720 at 30 fps mode through MJPEG:
+
+```text
+vcodec=mjpeg min s=1280x720 fps=10 max s=1280x720 fps=120
+```
+
+The same resolution over YUYV is only exposed at 10 fps, so MouseTracker must
+select MJPEG for 720p30. On Windows, `--device auto` is intentionally
+DECXIN-specific: it prefers `DECXIN CAMERA` and refuses to silently use the
+laptop webcam or OBS virtual camera.
+
+Because the DECXIN camera is monochrome, MouseTracker decodes captured frames
+internally as raw `gray` frames instead of triplicated RGB/BGR. A 1280x720 frame
+is therefore 921,600 bytes in the Python capture pipeline, while the finalized
+MP4 is still validated as HEVC 1280x720 at 30 fps.
+
 ## Default Output Directory
 
 Native Windows default:
@@ -144,6 +181,10 @@ segment_frame_index
 wall_time_iso8601
 wall_time_unix_ns
 monotonic_ns
+timestamp_source
+capture_arrival_wall_time_unix_ns
+capture_arrival_monotonic_ns
+capture_arrival_offset_ms
 elapsed_from_recording_start_s
 elapsed_from_segment_start_s
 inter_frame_interval_ms
@@ -153,6 +194,23 @@ gap_flag
 ```
 
 Wall-clock time is used for filenames and correlation with RFID event timestamps. Monotonic time is used for frame intervals, gap detection, segment rollover, and movement-timing calculations.
+
+On Windows DirectShow, MouseTracker defaults to `timestamp_source=cadence`.
+FFmpeg/DirectShow reports the DECXIN stream as constant 30 fps, but Python's
+raw pipe receives decoded frames in scheduler-sized bursts. The cadence
+timestamp source anchors the first accepted frame to wall/performance-counter
+time, then timestamps frame `n` at `n / fps`. This matches the HEVC video frame
+timeline and prevents Windows pipe-delivery jitter from looking like animal
+movement timing jitter.
+
+The raw delivery timing is still preserved for diagnostics:
+
+- `capture_arrival_wall_time_unix_ns`
+- `capture_arrival_monotonic_ns`
+- `capture_arrival_offset_ms`
+
+Use `--timestamp-source arrival` only when you specifically want the Python
+raw-frame arrival time instead of the video frame cadence.
 
 ## Validation
 
@@ -165,6 +223,56 @@ After each segment closes, the recorder runs `ffprobe` and verifies:
 - video frame count matches CSV row count when FFprobe can count frames
 
 Invalid segments are preserved and receive a `.invalid` marker with diagnostics.
+
+## Movement Analysis
+
+The next layer after recording is offline movement analysis. This is meant for
+the CSDS problem where a blurry webcam recording can make the mouse look like a
+soft ghost and hide minor movements.
+
+For each finalized segment, the analyzer reads:
+
+```text
+record_YYYYMMDD_HHMMSS.mp4
+record_YYYYMMDD_HHMMSS_timestamps.csv
+```
+
+and writes:
+
+```text
+record_YYYYMMDD_HHMMSS_movement.csv
+record_YYYYMMDD_HHMMSS_movement_summary.json
+```
+
+Run it manually:
+
+```powershell
+py -m rfid_tracking.analysis.movement `
+  D:\MouseTracker\data\mota\record_20260715_144320.mp4 `
+  --width 1280 `
+  --height 720 `
+  --fps 30
+```
+
+The movement CSV keeps the original timestamp fields and adds per-frame
+measurements:
+
+- motion pixels
+- motion index
+- mean absolute frame difference
+- motion centroid
+- motion bounding box
+- left/center/right motion zone
+- edge sharpness
+- immobility flag
+- blur-risk flag
+
+The GUI also includes an `Analyze Latest Movement` button, which analyzes the
+newest finalized `record_*.mp4` in the selected output directory.
+
+This analysis does not yet claim final CSDS scoring. It produces synchronized
+movement features that can later feed freezing, velocity, zone occupancy,
+approach/avoidance, and social-interaction scoring.
 
 ## File Lifecycle
 
@@ -208,4 +316,3 @@ The automated unit tests do not require a physical camera or FFmpeg:
 ```powershell
 py -m unittest discover -s tests
 ```
-

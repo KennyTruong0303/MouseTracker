@@ -15,8 +15,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal
 
+from rfid_tracking.analysis.movement import MotionSettings, MovementSummary, analyze_video
+
 from .camera import (
     CameraDevice,
+    DECXIN_CAMERA_NAME,
+    DECXIN_DEFAULT_INPUT_FORMAT,
+    DECXIN_DEFAULT_FPS,
+    DECXIN_DEFAULT_HEIGHT,
+    DECXIN_DEFAULT_WIDTH,
     discover_camera,
     list_dshow_devices_raw,
     parse_dshow_video_devices,
@@ -25,11 +32,14 @@ from .camera import (
 from .encoder import require_tool, select_hevc_encoder
 from .ffmpeg_recorder import (
     DEFAULT_OUTPUT_DIR,
+    DEFAULT_QUEUE_SIZE,
     RecorderState,
     RecorderStats,
     capture_command,
     check_output_dir,
     disk_free_bytes,
+    frame_byte_count,
+    high_resolution_monotonic_ns,
     run_recording,
     timezone_offset_string,
 )
@@ -43,15 +53,15 @@ CheckStatus = Literal["pass", "warn", "fail"]
 @dataclass(frozen=True)
 class RecorderConfig:
     backend: str = "auto"
-    device: str = "DECXIN CAMERA"
+    device: str = DECXIN_CAMERA_NAME
     output_dir: Path = DEFAULT_OUTPUT_DIR
-    width: int = 1280
-    height: int = 720
-    fps: float = 30.0
+    width: int = DECXIN_DEFAULT_WIDTH
+    height: int = DECXIN_DEFAULT_HEIGHT
+    fps: float = DECXIN_DEFAULT_FPS
     segment_seconds: float = 60.0
     encoder: str = "auto"
     gap_threshold_ms: float = 50.0
-    queue_size: int = 300
+    queue_size: int = DEFAULT_QUEUE_SIZE
     synthetic: bool = False
     duration_seconds: float = 0.0
     skip_validation: bool = False
@@ -59,6 +69,7 @@ class RecorderConfig:
     stop_file: Path | None = None
     camera_controls_config: str | None = None
     expected_timezone_offset: str | None = "+08:00"
+    timestamp_source: str = "auto"
     run_short_camera_read: bool = True
     ffmpeg_bin_dir: Path | None = None
 
@@ -87,6 +98,7 @@ class PreviewFrame:
     data: bytes
     width: int
     height: int
+    pixel_format: str
     global_frame_index: int
     wall_time_unix_ns: int
     monotonic_ns: int
@@ -244,6 +256,34 @@ class RecorderService:
                     backend=backend,
                 )
                 checks.append(PreflightCheck("camera", "pass", camera.name))
+                if backend == "dshow":
+                    if camera.profile == "DECXIN":
+                        checks.append(
+                            PreflightCheck(
+                                "DECXIN profile",
+                                "pass",
+                                (
+                                    f"{camera.name}; USB VID:PID "
+                                    f"{camera.usb_vid or 'unknown'}:{camera.usb_pid or 'unknown'}; "
+                                    f"REV {camera.usb_revision or 'unknown'}; MI {camera.usb_interface or 'unknown'}; "
+                                    f"{camera.sensor_color}; {camera.shutter_type} shutter; "
+                                    f"{DECXIN_DEFAULT_INPUT_FORMAT} "
+                                    f"{DECXIN_DEFAULT_WIDTH}x{DECXIN_DEFAULT_HEIGHT}@{DECXIN_DEFAULT_FPS:g}; "
+                                    f"raw {camera.raw_pixel_format}; "
+                                    f"instance {camera.device_instance_path or 'unknown'}"
+                                ),
+                                required=False,
+                            )
+                        )
+                    else:
+                        checks.append(
+                            PreflightCheck(
+                                "DECXIN profile",
+                                "warn",
+                                f"Selected DirectShow camera is {camera.name}, not {DECXIN_CAMERA_NAME}.",
+                                required=False,
+                            )
+                        )
                 checks.append(
                     PreflightCheck(
                         "exact camera mode",
@@ -329,6 +369,26 @@ class RecorderService:
     def recover_partials(self, output_dir: Path, *, width: int = 1280, height: int = 720, fps: float = 30.0) -> RecoveryReport:
         return RecoveryReport(recover_partials_in_dir(output_dir, width=width, height=height, fps=fps))
 
+    def analyze_movement(self, video_path: Path, *, width: int = 1280, height: int = 720, fps: float = 30.0) -> MovementSummary:
+        return analyze_video(video_path, settings=MotionSettings(width=width, height=height, fps=fps))
+
+    def analyze_latest_movement(
+        self,
+        output_dir: Path,
+        *,
+        width: int = 1280,
+        height: int = 720,
+        fps: float = 30.0,
+    ) -> MovementSummary:
+        videos = sorted(
+            output_dir.glob("record_*.mp4"),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+        if not videos:
+            raise FileNotFoundError(f"No finalized recording MP4 files found in {output_dir}")
+        return self.analyze_movement(videos[0], width=width, height=height, fps=fps)
+
     def _status_poller(self, output_dir: Path, state: RecorderState, callback: StatusCallback) -> None:
         while not self._finished.is_set():
             callback(self._status_from_state(output_dir, state, "recording"))
@@ -336,7 +396,7 @@ class RecorderService:
 
     def _status_from_state(self, output_dir: Path, state: RecorderState, state_name: str) -> RecorderStatus:
         stats = state.stats
-        now_ns = time.monotonic_ns()
+        now_ns = high_resolution_monotonic_ns()
         elapsed = 0.0
         if stats.recording_start_monotonic_ns is not None:
             elapsed = max(0.0, (now_ns - stats.recording_start_monotonic_ns) / 1_000_000_000)
@@ -381,6 +441,7 @@ class RecorderService:
                     data=packet.data,
                     width=config.width,
                     height=config.height,
+                    pixel_format=packet.pixel_format,
                     global_frame_index=packet.global_frame_index,
                     wall_time_unix_ns=packet.wall_time_unix_ns,
                     monotonic_ns=packet.monotonic_ns,
@@ -408,11 +469,12 @@ class RecorderService:
             stop_file=config.stop_file,
             camera_controls_config=config.camera_controls_config,
             expected_timezone_offset=config.expected_timezone_offset,
+            timestamp_source=config.timestamp_source,
         )
 
     def _short_camera_read(self, camera: CameraDevice, config: RecorderConfig) -> tuple[bool, str]:
         command = capture_command(camera, config.width, config.height, config.fps)
-        frame_bytes = config.width * config.height * 3
+        frame_bytes = frame_byte_count(config.width, config.height, camera.raw_pixel_format)
         process: subprocess.Popen[bytes] | None = None
         try:
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
@@ -426,7 +488,7 @@ class RecorderService:
             data = process.stdout.read(frame_bytes)
             if len(data) != frame_bytes:
                 return False, f"read {len(data)} of {frame_bytes} bytes"
-            return True, f"read one {config.width}x{config.height} frame"
+            return True, f"read one {config.width}x{config.height} {camera.raw_pixel_format} frame"
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)
         finally:

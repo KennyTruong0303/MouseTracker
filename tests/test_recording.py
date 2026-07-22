@@ -12,28 +12,46 @@ from unittest import mock
 from rfid_tracking.recording import encoder
 from rfid_tracking.recording.camera import (
     CameraDevice,
+    DECXIN_CAMERA_NAME,
+    DECXIN_HARDWARE_IDS,
+    DECXIN_PARENT_DEVICE,
+    DECXIN_USB_PID,
+    DECXIN_USB_REV,
+    DECXIN_USB_VID,
     choose_dshow_input_format,
+    decxin_device_info,
     discover_dshow_camera,
+    dshow_alternative_to_device_instance_path,
+    parse_dshow_modes,
+    parse_dshow_video_device_infos,
     parse_dshow_video_devices,
     resolve_backend,
 )
 from rfid_tracking.recording.ffmpeg_recorder import (
+    DEFAULT_QUEUE_SIZE,
     RecorderState,
     RecorderStats,
     SENTINEL,
     SegmentState,
+    build_parser,
     SegmentWriter,
     capture_command,
     capture_thread,
+    create_clock_anchor,
     default_stop_file,
+    frame_byte_count,
+    high_resolution_monotonic_ns,
     keyboard_stop_thread,
     main,
     put_packet,
     request_stop_file,
+    resolve_timestamp_source,
     stop_file_watcher_thread,
     synthetic_capture_thread,
+    wall_time_from_anchor,
     writer_thread,
 )
+from rfid_tracking.recording.service import RecorderConfig
 from rfid_tracking.recording.timestamps import (
     EXPECTED_INTERVAL_MS,
     FramePacket,
@@ -83,6 +101,13 @@ class FakeFullQueue:
         return 0
 
 
+class RecorderDefaultTests(unittest.TestCase):
+    def test_default_queue_size_has_csds_headroom(self):
+        self.assertEqual(DEFAULT_QUEUE_SIZE, 900)
+        self.assertEqual(build_parser().parse_args([]).queue_size, DEFAULT_QUEUE_SIZE)
+        self.assertEqual(RecorderConfig().queue_size, DEFAULT_QUEUE_SIZE)
+
+
 class ShutdownDuringCaptureRead:
     def __init__(self, state: RecorderState):
         self.state = state
@@ -111,6 +136,49 @@ class CaptureExitPopen:
 
 
 class RecordingTimestampTests(unittest.TestCase):
+    def test_high_resolution_monotonic_uses_perf_counter(self):
+        with mock.patch("rfid_tracking.recording.ffmpeg_recorder.time.perf_counter_ns", return_value=123456):
+            self.assertEqual(high_resolution_monotonic_ns(), 123456)
+
+    def test_wall_time_anchor_uses_high_resolution_monotonic_delta(self):
+        with mock.patch("rfid_tracking.recording.ffmpeg_recorder.time.time_ns", return_value=1_000_000_000):
+            with mock.patch(
+                "rfid_tracking.recording.ffmpeg_recorder.high_resolution_monotonic_ns",
+                return_value=5_000_000_000,
+            ):
+                anchor = create_clock_anchor()
+        self.assertEqual(wall_time_from_anchor(anchor, 5_033_333_333), 1_033_333_333)
+
+    def test_timestamp_row_includes_source_and_arrival_diagnostics(self):
+        packet = FramePacket(
+            b"x",
+            1,
+            1_700_000_000_033_333_333,
+            2_000_033_333,
+            capture_arrival_wall_time_unix_ns=1_700_000_000_040_000_000,
+            capture_arrival_monotonic_ns=2_000_040_000,
+            timestamp_source="cadence",
+        )
+        row = timestamp_row(
+            packet,
+            segment_filename="record_20260721_191201.mp4",
+            segment_frame_index=1,
+            recording_start_monotonic_ns=2_000_000_000,
+            segment_start_monotonic_ns=2_000_000_000,
+            previous_frame_monotonic_ns=2_000_000_000,
+            expected_interval_ms=1000.0 / 30.0,
+            gap_threshold_ms=50.0,
+        )
+        self.assertEqual(row["timestamp_source"], "cadence")
+        self.assertEqual(row["capture_arrival_monotonic_ns"], 2_000_040_000)
+        self.assertAlmostEqual(row["capture_arrival_offset_ms"], 0.006667)
+
+    def test_timestamp_source_auto_uses_cadence_for_directshow(self):
+        camera = CameraDevice("dshow", "DECXIN CAMERA", "DECXIN CAMERA", "", "mjpeg")
+        self.assertEqual(resolve_timestamp_source("auto", camera=camera, synthetic=False), "cadence")
+        self.assertEqual(resolve_timestamp_source("auto", camera=None, synthetic=True), "cadence")
+        self.assertEqual(resolve_timestamp_source("arrival", camera=camera, synthetic=False), "arrival")
+
     def test_filename_formatting_and_matching_names(self):
         paths = segment_paths(Path("/tmp/out"), 1_784_087_000_000_000_000)
         self.assertRegex(paths.final_video.name, r"record_\d{8}_\d{6}\.mp4")
@@ -627,6 +695,18 @@ class EncoderProbeTests(unittest.TestCase):
 
 
 class DirectShowBackendTests(unittest.TestCase):
+    DECXIN_LISTING = r"""
+[dshow @ 000001] DirectShow video devices (some may be both video and audio devices)
+[dshow @ 000001]  "Smart Connect Camera"
+[dshow @ 000001]     Alternative name "@device_pnp_\\?\root#camera#0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\global"
+[dshow @ 000001]  "DECXIN CAMERA"
+[dshow @ 000001]     Alternative name "@device_pnp_\\?\usb#vid_1bcf&pid_2cd1&mi_00#6&1bd18552&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
+[dshow @ 000001]  "Integrated Camera"
+[dshow @ 000001]     Alternative name "@device_pnp_\\?\usb#vid_13d3&pid_56ff&mi_00#7&2897bf3a&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
+[dshow @ 000001] DirectShow audio devices
+[dshow @ 000001]  "Microphone"
+"""
+
     def test_parse_dshow_video_devices(self):
         listing = """
 [dshow @ 000001] DirectShow video devices (some may be both video and audio devices)
@@ -637,6 +717,49 @@ class DirectShowBackendTests(unittest.TestCase):
 [dshow @ 000001]  "Microphone"
 """
         self.assertEqual(parse_dshow_video_devices(listing), ["USB Camera", "Integrated Webcam"])
+
+    def test_parse_dshow_video_device_infos_extracts_decxin_usb_identity(self):
+        devices = parse_dshow_video_device_infos(self.DECXIN_LISTING)
+        decxin = decxin_device_info(devices)
+        self.assertIsNotNone(decxin)
+        assert decxin is not None
+        self.assertEqual(decxin.name, DECXIN_CAMERA_NAME)
+        self.assertEqual(decxin.usb_vid, DECXIN_USB_VID)
+        self.assertEqual(decxin.usb_pid, DECXIN_USB_PID)
+        self.assertEqual(decxin.usb_interface, "00")
+        self.assertEqual(
+            decxin.device_instance_path,
+            r"USB\VID_1BCF&PID_2CD1&MI_00\6&1BD18552&0&0000",
+        )
+        self.assertIn("vid_1bcf&pid_2cd1", decxin.alternative_name or "")
+        self.assertTrue(decxin.is_decxin)
+
+    def test_dshow_alternative_name_converts_to_device_instance_path(self):
+        alternative = (
+            r"@device_pnp_\\?\usb#vid_1bcf&pid_2cd1&mi_00#6&1bd18552&0&0000"
+            r"#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
+        )
+        self.assertEqual(
+            dshow_alternative_to_device_instance_path(alternative),
+            r"USB\VID_1BCF&PID_2CD1&MI_00\6&1BD18552&0&0000",
+        )
+
+    def test_parse_dshow_video_device_infos_accepts_ffmpeg_8_inline_device_type(self):
+        listing = r"""
+[in#0 @ 000001] "Smart Connect Camera" (video)
+[in#0 @ 000001]   Alternative name "@device_pnp_\\?\root#camera#0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
+[in#0 @ 000001] "DECXIN CAMERA" (video)
+[in#0 @ 000001]   Alternative name "@device_pnp_\\?\usb#vid_1bcf&pid_2cd1&mi_00#6&1bd18552&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
+[in#0 @ 000001] "OBS Virtual Camera" (none)
+[in#0 @ 000001] "Microphone Array (Realtek(R) Audio)" (audio)
+"""
+        devices = parse_dshow_video_device_infos(listing)
+        self.assertEqual([device.name for device in devices], ["Smart Connect Camera", "DECXIN CAMERA"])
+        decxin = decxin_device_info(devices)
+        self.assertIsNotNone(decxin)
+        assert decxin is not None
+        self.assertEqual(decxin.usb_vid, DECXIN_USB_VID)
+        self.assertEqual(decxin.usb_pid, DECXIN_USB_PID)
 
     def test_choose_dshow_input_format_prefers_mjpeg_exact_mode(self):
         options = """
@@ -653,6 +776,18 @@ class DirectShowBackendTests(unittest.TestCase):
         self.assertEqual(choose_dshow_input_format(options, 1280, 720, 30.0), "mjpeg")
         self.assertIsNone(choose_dshow_input_format(options, 1280, 720, 121.0))
         self.assertIsNone(choose_dshow_input_format(options, 640, 480, 30.0))
+
+    def test_parse_dshow_modes_reports_decxin_mjpeg_range(self):
+        options = """
+[dshow @ 000001]   vcodec=mjpeg min s=1280x720 fps=10 max s=1280x720 fps=120
+"""
+        modes = parse_dshow_modes(options)
+        self.assertEqual(len(modes), 1)
+        mode = modes[0]
+        self.assertEqual(mode.input_format, "mjpeg")
+        self.assertEqual((mode.width, mode.height), (1280, 720))
+        self.assertEqual((mode.min_fps, mode.max_fps), (10.0, 120.0))
+        self.assertTrue(mode.supports(1280, 720, 30.0))
 
     def test_discover_dshow_camera_accepts_decxin_mjpeg_range(self):
         def runner(command, check=False, text=True, capture_output=True, timeout=10.0):
@@ -683,6 +818,66 @@ class DirectShowBackendTests(unittest.TestCase):
         self.assertEqual(camera.width, 1280)
         self.assertEqual(camera.height, 720)
         self.assertEqual(camera.fps, 30.0)
+
+    def test_discover_dshow_auto_prefers_decxin_over_other_cameras(self):
+        def runner(command, check=False, text=True, capture_output=True, timeout=10.0):
+            if "-list_devices" in command:
+                return mock.Mock(returncode=1, stdout="", stderr=self.DECXIN_LISTING)
+            if "-list_options" in command:
+                self.assertIn("video=DECXIN CAMERA", command)
+                return mock.Mock(
+                    returncode=1,
+                    stdout="",
+                    stderr="[dshow @ 000001]   vcodec=mjpeg min s=1280x720 fps=10 max s=1280x720 fps=120\n",
+                )
+            raise AssertionError(f"Unexpected command: {command}")
+
+        camera = discover_dshow_camera(
+            device="auto",
+            width=1280,
+            height=720,
+            fps=30.0,
+            runner=runner,
+        )
+        self.assertEqual(camera.name, DECXIN_CAMERA_NAME)
+        self.assertEqual(camera.profile, "DECXIN")
+        self.assertEqual(camera.usb_vid, DECXIN_USB_VID)
+        self.assertEqual(camera.usb_pid, DECXIN_USB_PID)
+        self.assertEqual(camera.usb_revision, DECXIN_USB_REV)
+        self.assertEqual(camera.usb_interface, "00")
+        self.assertEqual(camera.hardware_ids, DECXIN_HARDWARE_IDS)
+        self.assertEqual(camera.parent_device, DECXIN_PARENT_DEVICE)
+        self.assertEqual(
+            camera.device_instance_path,
+            r"USB\VID_1BCF&PID_2CD1&MI_00\6&1BD18552&0&0000",
+        )
+        self.assertIn("9281", camera.sensor_model_hint or "")
+        self.assertEqual(camera.preferred_input_format, "mjpeg")
+        self.assertEqual(camera.sensor_color, "monochrome")
+        self.assertEqual(camera.shutter_type, "global")
+        self.assertEqual(camera.raw_pixel_format, "gray")
+
+    def test_discover_dshow_auto_rejects_non_decxin_cameras(self):
+        listing = """
+[dshow @ 000001] DirectShow video devices
+[dshow @ 000001]  "Smart Connect Camera"
+[dshow @ 000001]  "Integrated Camera"
+[dshow @ 000001] DirectShow audio devices
+"""
+
+        def runner(command, check=False, text=True, capture_output=True, timeout=10.0):
+            if "-list_devices" in command:
+                return mock.Mock(returncode=1, stdout="", stderr=listing)
+            raise AssertionError("Auto discovery should fail before reading camera options")
+
+        with self.assertRaisesRegex(RuntimeError, "DECXIN CAMERA was not found"):
+            discover_dshow_camera(
+                device="auto",
+                width=1280,
+                height=720,
+                fps=30.0,
+                runner=runner,
+            )
 
     def test_resolve_backend_auto_uses_native_platform(self):
         expected = "dshow" if __import__("os").name == "nt" else "v4l2"
@@ -724,6 +919,26 @@ class DirectShowBackendTests(unittest.TestCase):
         )
         self.assertNotIn("-input_format", command)
         self.assertNotIn('"USB Camera"', command)
+
+    def test_decxin_capture_command_decodes_to_gray_raw_frames(self):
+        camera = CameraDevice(
+            backend="dshow",
+            path="DECXIN CAMERA",
+            name="DECXIN CAMERA",
+            formats_text="",
+            preferred_input_format="mjpeg",
+            profile="DECXIN",
+            sensor_color="monochrome",
+            shutter_type="global",
+            raw_pixel_format="gray",
+        )
+        command = capture_command(camera, 1280, 720, 30.0)
+        self.assertIn("-vcodec", command)
+        self.assertIn("mjpeg", command)
+        pix_fmt_index = command.index("-pix_fmt")
+        self.assertEqual(command[pix_fmt_index + 1], "gray")
+        self.assertEqual(frame_byte_count(1280, 720, "gray"), 921600)
+        self.assertEqual(frame_byte_count(1280, 720, "bgr24"), 2764800)
 
 
 if __name__ == "__main__":

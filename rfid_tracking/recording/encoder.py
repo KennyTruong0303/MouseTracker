@@ -173,6 +173,7 @@ def build_encode_command(
     width: int,
     height: int,
     fps: float,
+    input_pixel_format: str = "bgr24",
 ) -> list[str]:
     return [
         "ffmpeg",
@@ -183,7 +184,7 @@ def build_encode_command(
         "-f",
         "rawvideo",
         "-pix_fmt",
-        "bgr24",
+        input_pixel_format,
         "-s:v",
         f"{width}x{height}",
         "-r",

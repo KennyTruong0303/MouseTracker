@@ -9,7 +9,9 @@ import sys
 import traceback
 from pathlib import Path
 
+from .camera import DECXIN_CAMERA_NAME
 from .ffmpeg_recorder import DEFAULT_OUTPUT_DIR
+from rfid_tracking.analysis.movement import MovementSummary
 from .service import (
     PreflightResult,
     PreviewFrame,
@@ -61,7 +63,7 @@ except ImportError:  # pragma: no cover - exercised in environments without Qt.
     PYSIDE6_AVAILABLE = False
 
 
-DEFAULT_CAMERA_NAME = "DECXIN CAMERA"
+DEFAULT_CAMERA_NAME = DECXIN_CAMERA_NAME
 LOG_LEVELS = {"all": logging.INFO, "warnings and errors": logging.WARNING, "errors only": logging.ERROR}
 
 
@@ -142,6 +144,7 @@ if PYSIDE6_AVAILABLE:
         statusChanged = Signal(object)
         previewFrame = Signal(object)
         recoveryFinished = Signal(object)
+        analysisFinished = Signal(object)
         errorOccurred = Signal(str)
         finished = Signal(int)
 
@@ -191,12 +194,28 @@ if PYSIDE6_AVAILABLE:
                 logging.getLogger("rfid_tracking.recording").exception("GUI recovery failed")
                 self.errorOccurred.emit(str(exc))
 
+        @Slot(object)
+        def analyze_latest_movement(self, config: RecorderConfig) -> None:
+            try:
+                self.analysisFinished.emit(
+                    self.service.analyze_latest_movement(
+                        config.output_dir,
+                        width=config.width,
+                        height=config.height,
+                        fps=config.fps,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger("rfid_tracking.recording").exception("GUI movement analysis failed")
+                self.errorOccurred.emit(str(exc))
+
 
     class MainWindow(QMainWindow):
         preflightRequested = Signal(object)
         startRequested = Signal(object, object)
         stopRequested = Signal(str)
         recoveryRequested = Signal(object)
+        analysisRequested = Signal(object)
 
         def __init__(self):
             super().__init__()
@@ -215,10 +234,12 @@ if PYSIDE6_AVAILABLE:
             self.startRequested.connect(self.worker.start_recording)
             self.stopRequested.connect(self.worker.stop_recording)
             self.recoveryRequested.connect(self.worker.recover)
+            self.analysisRequested.connect(self.worker.analyze_latest_movement)
             self.worker.preflightFinished.connect(self.on_preflight_finished)
             self.worker.statusChanged.connect(self.on_status)
             self.worker.previewFrame.connect(self.on_preview_frame)
             self.worker.recoveryFinished.connect(self.on_recovery_finished)
+            self.worker.analysisFinished.connect(self.on_analysis_finished)
             self.worker.errorOccurred.connect(self.on_error)
             self.worker.finished.connect(self.on_recording_finished)
 
@@ -410,7 +431,14 @@ if PYSIDE6_AVAILABLE:
             self.stop_button = QPushButton("Stop Recording")
             self.open_button = QPushButton("Open Output Folder")
             self.recover_button = QPushButton("Recover Partial Files")
-            for button in (self.start_button, self.stop_button, self.open_button, self.recover_button):
+            self.analyze_button = QPushButton("Analyze Latest Movement")
+            for button in (
+                self.start_button,
+                self.stop_button,
+                self.open_button,
+                self.recover_button,
+                self.analyze_button,
+            ):
                 button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
@@ -418,10 +446,12 @@ if PYSIDE6_AVAILABLE:
             self.stop_button.clicked.connect(self.stop_recording)
             self.open_button.clicked.connect(self.open_output_folder)
             self.recover_button.clicked.connect(lambda: self.recoveryRequested.emit(self.config_from_ui()))
+            self.analyze_button.clicked.connect(lambda: self.analysisRequested.emit(self.config_from_ui()))
             grid.addWidget(self.start_button, 0, 0)
             grid.addWidget(self.stop_button, 0, 1)
             grid.addWidget(self.open_button, 1, 0)
             grid.addWidget(self.recover_button, 1, 1)
+            grid.addWidget(self.analyze_button, 2, 0, 1, 2)
             grid.setColumnStretch(0, 1)
             grid.setColumnStretch(1, 1)
             return group
@@ -632,7 +662,10 @@ if PYSIDE6_AVAILABLE:
         def on_preview_frame(self, frame: PreviewFrame) -> None:
             if not self.preview_checkbox.isChecked():
                 return
-            image = QImage(frame.data, frame.width, frame.height, frame.width * 3, QImage.Format_BGR888).copy()
+            if frame.pixel_format == "gray":
+                image = QImage(frame.data, frame.width, frame.height, frame.width, QImage.Format_Grayscale8).copy()
+            else:
+                image = QImage(frame.data, frame.width, frame.height, frame.width * 3, QImage.Format_BGR888).copy()
             pixmap = QPixmap.fromImage(image).scaled(
                 self.preview_label.size(),
                 Qt.KeepAspectRatio,
@@ -642,6 +675,16 @@ if PYSIDE6_AVAILABLE:
 
         def on_recovery_finished(self, report: RecoveryReport) -> None:
             QMessageBox.information(self, "Partial Recovery", report.message)
+
+        def on_analysis_finished(self, summary: MovementSummary) -> None:
+            QMessageBox.information(
+                self,
+                "Movement Analysis",
+                "Movement analysis complete.\n"
+                f"CSV: {summary.movement_csv}\n"
+                f"Summary: {summary.summary_json}\n"
+                f"Frames matched: {summary.frame_count_match}",
+            )
 
         def on_error(self, message: str) -> None:
             QMessageBox.critical(self, "Recorder Error", message)

@@ -196,6 +196,53 @@ class RecorderServiceTests(unittest.TestCase):
         self.assertEqual(camera.status, "fail")
         self.assertIn("camera busy", camera.detail)
 
+    def test_preflight_reports_decxin_profile(self):
+        camera = CameraDevice(
+            backend="dshow",
+            path="DECXIN CAMERA",
+            name="DECXIN CAMERA",
+            formats_text="",
+            preferred_input_format="mjpeg",
+            width=1280,
+            height=720,
+            fps=30.0,
+            alternative_name=r"@device_pnp_\\?\usb#vid_1bcf&pid_2cd1&mi_00#x\global",
+            usb_vid="1bcf",
+            usb_pid="2cd1",
+            usb_revision="9281",
+            usb_interface="00",
+            hardware_ids=(
+                r"USB\VID_1BCF&PID_2CD1&REV_9281&MI_00",
+                r"USB\VID_1BCF&PID_2CD1&MI_00",
+            ),
+            device_instance_path=r"USB\VID_1BCF&PID_2CD1&MI_00\6&1BD18552&0&0000",
+            parent_device=r"USB\VID_1BCF&PID_2CD1\01.00.00",
+            bus_reported_description="DECXIN CAMERA",
+            sensor_model_hint="9281 monochrome global-shutter UVC sensor family",
+            profile="DECXIN",
+            sensor_color="monochrome",
+            shutter_type="global",
+            raw_pixel_format="gray",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config = RecorderConfig(output_dir=Path(tmp), device="DECXIN CAMERA", run_short_camera_read=False)
+            with mock.patch("rfid_tracking.recording.service.require_tool", return_value="tool.exe"):
+                with mock.patch("rfid_tracking.recording.service.discover_camera", return_value=camera):
+                    with mock.patch("rfid_tracking.recording.service.select_hevc_encoder", return_value=mock.Mock(name="hevc_qsv")):
+                        result = RecorderService().run_preflight(config)
+
+        profile = next(check for check in result.checks if check.name == "DECXIN profile")
+        mode = next(check for check in result.checks if check.name == "exact camera mode")
+        self.assertEqual(profile.status, "pass")
+        self.assertIn("1bcf:2cd1", profile.detail)
+        self.assertIn("monochrome", profile.detail)
+        self.assertIn("global shutter", profile.detail)
+        self.assertIn("raw gray", profile.detail)
+        self.assertIn("REV 9281", profile.detail)
+        self.assertIn("MI 00", profile.detail)
+        self.assertIn(r"USB\VID_1BCF&PID_2CD1&MI_00", profile.detail)
+        self.assertEqual(mode.detail, "mjpeg 1280x720@30")
+
     def test_session_metadata_json_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = write_session_metadata(

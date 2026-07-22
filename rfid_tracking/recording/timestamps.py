@@ -19,6 +19,10 @@ CSV_COLUMNS = [
     "wall_time_iso8601",
     "wall_time_unix_ns",
     "monotonic_ns",
+    "timestamp_source",
+    "capture_arrival_wall_time_unix_ns",
+    "capture_arrival_monotonic_ns",
+    "capture_arrival_offset_ms",
     "elapsed_from_recording_start_s",
     "elapsed_from_segment_start_s",
     "inter_frame_interval_ms",
@@ -36,6 +40,10 @@ class FramePacket:
     global_frame_index: int
     wall_time_unix_ns: int
     monotonic_ns: int
+    pixel_format: str = "bgr24"
+    capture_arrival_wall_time_unix_ns: int | None = None
+    capture_arrival_monotonic_ns: int | None = None
+    timestamp_source: str = "arrival"
 
 
 @dataclass(frozen=True)
@@ -109,6 +117,10 @@ def timestamp_row(
         frame_gap_ms = interval_ms - expected_interval_ms
         gap_flag = interval_ms > gap_threshold_ms
 
+    arrival_offset_ms: float | str = ""
+    if packet.capture_arrival_monotonic_ns is not None:
+        arrival_offset_ms = ns_to_ms(packet.capture_arrival_monotonic_ns - packet.monotonic_ns)
+
     return {
         "segment_filename": segment_filename,
         "global_frame_index": packet.global_frame_index,
@@ -116,6 +128,10 @@ def timestamp_row(
         "wall_time_iso8601": local_datetime_from_ns(packet.wall_time_unix_ns).isoformat(),
         "wall_time_unix_ns": packet.wall_time_unix_ns,
         "monotonic_ns": packet.monotonic_ns,
+        "timestamp_source": packet.timestamp_source,
+        "capture_arrival_wall_time_unix_ns": packet.capture_arrival_wall_time_unix_ns or "",
+        "capture_arrival_monotonic_ns": packet.capture_arrival_monotonic_ns or "",
+        "capture_arrival_offset_ms": arrival_offset_ms,
         "elapsed_from_recording_start_s": ns_to_seconds(
             packet.monotonic_ns - recording_start_monotonic_ns
         ),

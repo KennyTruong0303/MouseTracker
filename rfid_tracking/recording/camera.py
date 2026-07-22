@@ -17,6 +17,25 @@ from typing import Callable, Literal
 LOGGER = logging.getLogger(__name__)
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 Backend = Literal["dshow", "v4l2"]
+DECXIN_CAMERA_NAME = "DECXIN CAMERA"
+DECXIN_USB_VID = "1bcf"
+DECXIN_USB_PID = "2cd1"
+DECXIN_USB_REV = "9281"
+DECXIN_USB_INTERFACE = "00"
+DECXIN_HARDWARE_IDS = (
+    r"USB\VID_1BCF&PID_2CD1&REV_9281&MI_00",
+    r"USB\VID_1BCF&PID_2CD1&MI_00",
+)
+DECXIN_PARENT_DEVICE = r"USB\VID_1BCF&PID_2CD1\01.00.00"
+DECXIN_BUS_REPORTED_DESCRIPTION = DECXIN_CAMERA_NAME
+DECXIN_SENSOR_MODEL_HINT = "9281 monochrome global-shutter UVC sensor family"
+DECXIN_DEFAULT_INPUT_FORMAT = "mjpeg"
+DECXIN_DEFAULT_WIDTH = 1280
+DECXIN_DEFAULT_HEIGHT = 720
+DECXIN_DEFAULT_FPS = 30.0
+DECXIN_SENSOR_COLOR = "monochrome"
+DECXIN_SHUTTER_TYPE = "global"
+DECXIN_RAW_PIXEL_FORMAT = "gray"
 
 
 WSL_CAMERA_DIAGNOSTIC = """No V4L2 camera was found.
@@ -52,6 +71,51 @@ class CameraDevice:
     width: int | None = None
     height: int | None = None
     fps: float | None = None
+    alternative_name: str | None = None
+    usb_vid: str | None = None
+    usb_pid: str | None = None
+    usb_revision: str | None = None
+    usb_interface: str | None = None
+    hardware_ids: tuple[str, ...] = ()
+    device_instance_path: str | None = None
+    parent_device: str | None = None
+    bus_reported_description: str | None = None
+    sensor_model_hint: str | None = None
+    profile: str | None = None
+    sensor_color: str | None = None
+    shutter_type: str | None = None
+    raw_pixel_format: str = "bgr24"
+
+
+@dataclass(frozen=True)
+class DirectShowDeviceInfo:
+    name: str
+    alternative_name: str | None = None
+    usb_vid: str | None = None
+    usb_pid: str | None = None
+    usb_interface: str | None = None
+    device_instance_path: str | None = None
+
+    @property
+    def is_decxin(self) -> bool:
+        return (
+            self.name == DECXIN_CAMERA_NAME
+            and (self.usb_vid in (None, DECXIN_USB_VID))
+            and (self.usb_pid in (None, DECXIN_USB_PID))
+        )
+
+
+@dataclass(frozen=True)
+class DirectShowMode:
+    input_format: str
+    width: int
+    height: int
+    min_fps: float
+    max_fps: float
+    raw_line: str
+
+    def supports(self, width: int, height: int, fps: float) -> bool:
+        return self.width == width and self.height == height and self.min_fps <= fps <= self.max_fps
 
 
 def resolve_backend(requested: str) -> Backend:
@@ -186,22 +250,87 @@ def list_dshow_devices_raw(runner: Runner = subprocess.run) -> str:
 
 
 def parse_dshow_video_devices(listing_text: str) -> list[str]:
-    devices: list[str] = []
+    return [device.name for device in parse_dshow_video_device_infos(listing_text)]
+
+
+def dshow_alternative_to_device_instance_path(alternative_name: str | None) -> str | None:
+    if not alternative_name:
+        return None
+    match = re.search(r"\\\\\?\\([^{}]+)#\{", alternative_name, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).replace("#", "\\").upper()
+
+
+def parse_dshow_video_device_infos(listing_text: str) -> list[DirectShowDeviceInfo]:
+    devices: list[DirectShowDeviceInfo] = []
     in_video_section = False
+    current_name: str | None = None
+
+    def append_current_without_alternative() -> None:
+        nonlocal current_name
+        if current_name is not None:
+            devices.append(DirectShowDeviceInfo(name=current_name))
+            current_name = None
+
     for line in listing_text.splitlines():
         lowered = line.lower()
         if "directshow video devices" in lowered:
             in_video_section = True
             continue
         if "directshow audio devices" in lowered:
+            append_current_without_alternative()
             in_video_section = False
             continue
-        if not in_video_section or "alternative name" in lowered:
-            continue
+
         match = re.search(r'"([^"]+)"', line)
+        if match and "(video)" in lowered:
+            append_current_without_alternative()
+            current_name = match.group(1)
+            in_video_section = True
+            continue
+        if match and ("(audio)" in lowered or "(none)" in lowered):
+            append_current_without_alternative()
+            in_video_section = False
+            continue
+
+        if "alternative name" in lowered:
+            if current_name is not None:
+                alt_match = re.search(r'"([^"]+)"', line)
+                alternative_name = alt_match.group(1) if alt_match else None
+                vid_match = re.search(r"vid_([0-9a-f]{4})", lowered)
+                pid_match = re.search(r"pid_([0-9a-f]{4})", lowered)
+                mi_match = re.search(r"mi_([0-9a-f]{2})", lowered)
+                devices.append(
+                    DirectShowDeviceInfo(
+                        name=current_name,
+                        alternative_name=alternative_name,
+                        usb_vid=vid_match.group(1) if vid_match else None,
+                        usb_pid=pid_match.group(1) if pid_match else None,
+                        usb_interface=mi_match.group(1) if mi_match else None,
+                        device_instance_path=dshow_alternative_to_device_instance_path(alternative_name),
+                    )
+                )
+                current_name = None
+            continue
+
+        if not in_video_section:
+            continue
         if match:
-            devices.append(match.group(1))
+            append_current_without_alternative()
+            current_name = match.group(1)
+    append_current_without_alternative()
     return devices
+
+
+def decxin_device_info(devices: list[DirectShowDeviceInfo]) -> DirectShowDeviceInfo | None:
+    for device in devices:
+        if device.is_decxin:
+            return device
+    for device in devices:
+        if device.name == DECXIN_CAMERA_NAME:
+            return device
+    return None
 
 
 def list_dshow_options(camera_name: str, runner: Runner = subprocess.run) -> str:
@@ -254,6 +383,51 @@ def _dshow_line_has_exact_mode(line: str, width: int, height: int, fps: float) -
     return any(abs(value - fps) < 0.01 for value in values)
 
 
+def parse_dshow_modes(options_text: str) -> list[DirectShowMode]:
+    modes: list[DirectShowMode] = []
+    range_re = re.compile(
+        r"(?:vcodec=(mjpeg|mjpg)|pixel_format=([a-z0-9]+))\s+"
+        r"min\s+s=(\d+)x(\d+)\s+fps=(\d+(?:\.\d+)?)\s+"
+        r"max\s+s=(\d+)x(\d+)\s+fps=(\d+(?:\.\d+)?)",
+        re.IGNORECASE,
+    )
+    for line in options_text.splitlines():
+        match = range_re.search(line)
+        if not match:
+            continue
+        codec = match.group(1)
+        pixel_format = match.group(2)
+        min_width = int(match.group(3))
+        min_height = int(match.group(4))
+        min_fps = float(match.group(5))
+        max_width = int(match.group(6))
+        max_height = int(match.group(7))
+        max_fps = float(match.group(8))
+        if min_width != max_width or min_height != max_height:
+            continue
+        input_format = "mjpeg" if codec else pixel_format.lower()
+        modes.append(
+            DirectShowMode(
+                input_format=input_format,
+                width=min_width,
+                height=min_height,
+                min_fps=min_fps,
+                max_fps=max_fps,
+                raw_line=line.strip(),
+            )
+        )
+    return modes
+
+
+def decxin_mode_report(options_text: str) -> str:
+    modes = parse_dshow_modes(options_text)
+    lines = [
+        f"{mode.input_format} {mode.width}x{mode.height} {mode.min_fps:g}-{mode.max_fps:g} fps"
+        for mode in modes
+    ]
+    return "\n".join(lines)
+
+
 def supports_exact_dshow_format(
     options_text: str,
     input_format: str,
@@ -262,6 +436,9 @@ def supports_exact_dshow_format(
     fps: float,
 ) -> bool:
     lowered_format = input_format.lower()
+    for mode in parse_dshow_modes(options_text):
+        if mode.input_format == lowered_format and mode.supports(width, height, fps):
+            return True
     for line in options_text.splitlines():
         lowered = line.lower()
         if not _dshow_line_has_exact_mode(lowered, width, height, fps):
@@ -290,7 +467,18 @@ def discover_dshow_camera(
     fps: float,
     runner: Runner = subprocess.run,
 ) -> CameraDevice:
-    candidates = parse_dshow_video_devices(list_dshow_devices_raw(runner=runner)) if device == "auto" else [device]
+    device_infos = parse_dshow_video_device_infos(list_dshow_devices_raw(runner=runner))
+    device_info_by_name = {info.name: info for info in device_infos}
+    if device == "auto":
+        preferred = decxin_device_info(device_infos)
+        candidates = [preferred.name] if preferred else []
+        if not candidates:
+            raise RuntimeError(
+                f"{DECXIN_CAMERA_NAME} was not found. Connected DirectShow cameras: "
+                + (", ".join(info.name for info in device_infos) or "none")
+            )
+    else:
+        candidates = [device]
     if not candidates:
         raise RuntimeError(DSHOW_CAMERA_DIAGNOSTIC)
 
@@ -299,6 +487,7 @@ def discover_dshow_camera(
         options = list_dshow_options(name, runner=runner)
         input_format = choose_dshow_input_format(options, width, height, fps)
         if input_format:
+            info = device_info_by_name.get(name)
             return CameraDevice(
                 backend="dshow",
                 path=name,
@@ -308,6 +497,20 @@ def discover_dshow_camera(
                 width=width,
                 height=height,
                 fps=fps,
+                alternative_name=info.alternative_name if info else None,
+                usb_vid=info.usb_vid if info else None,
+                usb_pid=info.usb_pid if info else None,
+                usb_revision=DECXIN_USB_REV if info and info.is_decxin else None,
+                usb_interface=(info.usb_interface or DECXIN_USB_INTERFACE) if info and info.is_decxin else None,
+                hardware_ids=DECXIN_HARDWARE_IDS if info and info.is_decxin else (),
+                device_instance_path=info.device_instance_path if info else None,
+                parent_device=DECXIN_PARENT_DEVICE if info and info.is_decxin else None,
+                bus_reported_description=DECXIN_BUS_REPORTED_DESCRIPTION if info and info.is_decxin else None,
+                sensor_model_hint=DECXIN_SENSOR_MODEL_HINT if info and info.is_decxin else None,
+                profile="DECXIN" if info and info.is_decxin else None,
+                sensor_color=DECXIN_SENSOR_COLOR if info and info.is_decxin else None,
+                shutter_type=DECXIN_SHUTTER_TYPE if info and info.is_decxin else None,
+                raw_pixel_format=DECXIN_RAW_PIXEL_FORMAT if info and info.is_decxin else "bgr24",
             )
         rejected.append(f"{name}: does not expose exactly {width}x{height} at {fps:g} fps")
 
